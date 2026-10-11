@@ -20,12 +20,15 @@ Progress is saved after every stage. A failure parks that photo and the run cont
 ## Install
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python gphotos_shrink.py --help        # or: pip install -e . && gphotos-shrink --help
+uv venv                                # picks Python 3.14 from .python-version, creates .venv
+uv pip install -e .                    # runtime only; use '.[dev]' (or -r requirements.txt) to add dev tools
+. .venv/bin/activate && gphotos-shrink --help
 ```
 
-Python 3.10+.
+Plain `python -m venv .venv && pip install -e .` works the same. Python 3.14 is the recommended version (everything is tested on it); 3.11 to 3.14 are supported.
+
+With uv, run tools as `uv run --no-sync <cmd>` or activate the venv. A bare `uv run` re-resolves the project and writes a `uv.lock`, which is git-ignored on purpose: there is no lockfile, so minor and patch releases flow in on their own.
+Dependencies are capped below the next major version, so minor and patch releases are picked up automatically and majors are bumped by hand. `gpwc` is not on PyPI and has no releases, so it is installed from a pinned git commit in `pyproject.toml`; bump that commit when you want its changes.
 
 ## Authentication
 
@@ -201,7 +204,12 @@ The gpmc library cache lives in `~/.gpmc/<email>/storage.db`. The first sync dow
 ## Tests
 
 ```bash
-pytest test_offline.py
+uv pip install -r requirements.txt     # or: pip install -r requirements.txt
+ruff check . && ruff format --check . && mypy && pytest
 ```
+
+The tests cover the helpers, the compression, the whole state machine, and the CLI happy paths (`scan`, `process`, `trash`, `undo`, `run`, `status`, `auth-check`) against fake Google clients.
+
+CI runs the same four commands on Python 3.11 to 3.14 for every push to `main` and every pull request.
 
 They run real compression on generated MPO files (EXIF, GPS, MPF stripping, resize) and drive the whole state machine, including `try`, against fake Google clients. They prove the tool's logic and its safety rules. They cannot prove Google accepts the calls.

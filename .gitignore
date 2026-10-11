@@ -224,3 +224,6 @@ cookies.txt
 auth_data.txt
 *cookies*.txt
 .gphotos-shrink/
+
+# uv lockfile: deliberately not committed, minor and patch bumps should flow in on their own
+uv.lock

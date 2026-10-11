@@ -1,9 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gphotos-shrink"
 version = "0.1.0"
 description = "Replace oversized Google Photos JPEGs with compressed copies, same albums, originals to trash."
-requires-python = ">=3.10"
-dependencies = ["gpmc>=0.9", "gpwc", "typer>=0.12", "pillow>=10", "requests", "rich"]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+# gpmc requires 3.11+, so this is the floor for the whole tool.
+requires-python = ">=3.11"
+# Floors are the versions the tests ran against; ceilings stop at the next major so
+# major bumps stay a manual decision. 0.x libraries (gpmc, gpwc, typer, ruff) treat the
+# minor as the breaking axis, so those are capped one minor up (gpmc, ruff) or at 1.0.
+# gpwc is not on PyPI and has no tags: it is pinned to a commit and bumped by hand.
+dependencies = [
+    "gpmc~=0.9.0",
+    "gpwc @ git+https://github.com/xob0t/google_photos_web_client@651aa268d50529cb6128c8a42c9cd4ce668f2189",
+    "typer>=0.27,<1",
+    "pillow>=12.3,<13",
+    "requests>=2.34,<3",
+    "rich>=15,<16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1,<10",
+    "ruff~=0.17.0",
+    "mypy>=2.4,<3",
+    "types-requests>=2.33,<3",
+]
 
 [project.scripts]
 gphotos-shrink = "gphotos_shrink:app"
@@ -13,6 +40,21 @@ py-modules = ["gphotos_shrink"]
 
 [tool.ruff]
 line-length = 160
+target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "PTH", "RUF", "BLE"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["gphotos_shrink.py", "test_offline.py"]
+
+# gpmc and gpwc ship no type information.
+[[tool.mypy.overrides]]
+module = ["gpmc", "gpmc.*", "gpwc", "gpwc.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["test_offline.py"]
+filterwarnings = ["error"]
