@@ -4,8 +4,10 @@
 Google Photos has no API to replace a photo, so the only workable loop is:
 download the original, compress it locally, upload the compressed copy, put it
 in the same albums, verify, then move the original to the Google Photos trash
-(restorable for 60 days). This tool runs that loop per photo as a resumable
-state machine and refuses to trash anything it has not verified.
+(restorable for at least 30 days). This tool runs that loop per photo as a
+resumable state machine and refuses to trash anything it has not verified. Every
+copy must also pass local outlier checks (size, aspect, metadata, pixel drift)
+before upload, and a batch halts at the first photo that fails one.
 
 Stages per photo: candidate, downloaded, compressed, uploaded, albums_done,
 verified, trashed. Failures stop the photo at its current stage and are retried
@@ -18,8 +20,9 @@ client covers everything:
 
 Typical session:
   gphotos-shrink auth-check
+  gphotos-shrink local photo.jpg -o out/   # vet the technique offline, no account needed
   gphotos-shrink scan
-  gphotos-shrink try --count 2        # interactive, 2 photos from different albums
+  gphotos-shrink try --album <name|link> -c 2   # interactive, 2 photos of one album
   gphotos-shrink process --apply      # upload + verify everything, trash nothing
   gphotos-shrink trash --apply        # after you eyeballed the result
 """
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import difflib
 import hashlib
 import json
 import math
@@ -35,10 +39,13 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import time
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
+from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -53,7 +60,7 @@ from gpwc.payloads import (
     GetAlbumPage,
     GetAlbumsPage,
 )
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
@@ -65,6 +72,19 @@ SHA1_B64_LEN = 27  # urlsafe base64 of a 20 byte digest, no padding
 GOOGLE_HOST_SUFFIXES = (".googleusercontent.com", ".google.com", ".googleapis.com")
 TS_TOLERANCE_MS = 2000
 
+# Chosen on a real 33 MP Sony JPEG: 8 MP Q85 scored SSIMULACRA2 83 at 1.8 MB, visually
+# indistinguishable from the original at photobook scale. See RESEARCH.md section 4.
+DEFAULT_QUALITY = 85
+DEFAULT_MAX_MP = 8.0
+DEFAULT_TARGET_MB = 2.0
+QUALITY_STEPS = (82, 80, 78, 75)  # tried in order when a copy exceeds the size budget
+SIZE_SLACK = 1.10
+ASPECT_TOLERANCE = 0.005
+DRIFT_THRESHOLD = 3.0  # mean absolute difference (0-255) of 256 px thumbnails
+LOCAL_PREFIX = "local: "  # marks pre-upload checks so verification can keep them
+WAIT_ATTEMPTS = 12  # eventual consistency: poll the library for about a minute
+WAIT_DELAY = 5.0
+
 console = Console(highlight=False)
 
 
@@ -72,8 +92,11 @@ class SkipItem(Exception):
     """The photo is fine as it is (for example, compression gains too little)."""
 
 
-class VerifyError(Exception):
-    """A post-upload check failed, so the original must stay untouched."""
+class Mode(StrEnum):
+    """How a copy is made."""
+
+    COMPRESS = "compress"  # downscale and re-encode, guaranteed small
+    STRIP = "strip"  # lossless: drop the MPF block and its trailing preview image
 
 
 @dataclass
@@ -81,11 +104,14 @@ class Config:
     """Compression and safety knobs shared by every command."""
 
     workdir: Path
-    quality: int = 88
-    max_mp: float = 16.0
+    quality: int = DEFAULT_QUALITY
+    max_mp: float = DEFAULT_MAX_MP
     min_saving: float = 0.20
     saver: bool = False
     verify_hash: bool = True
+    target_mb: float = DEFAULT_TARGET_MB
+    mode: Mode = Mode.COMPRESS
+    keep_going: bool = False
 
 
 @dataclass
@@ -96,6 +122,7 @@ class Selection:
     albums: list[str] = field(default_factory=list)
     ids: list[str] = field(default_factory=list)
     limit: int | None = None
+    include_shared: bool = False
 
 
 @dataclass
@@ -124,6 +151,8 @@ class Item:
     warnings: list[str] = field(default_factory=list)
     note: str = ""
     error: str = ""
+    made_with: str = ""  # settings that produced the copy, so a changed run re-makes it
+    trash_requested: bool = False  # set before the trash call, so undo still restores after a lagging confirmation
     updated_at: float = 0.0
 
 
@@ -174,7 +203,7 @@ class Cache:
 
     _CANDIDATES = """
         SELECT media_key, dedup_key, file_name, size_bytes, quota_charged_bytes, width, height,
-               utc_timestamp, caption, is_favorite, is_archived, is_original_quality, make, model
+               utc_timestamp, caption, is_favorite, is_archived
         FROM remote_media
         WHERE (trash_timestamp IS NULL OR trash_timestamp = 0)
           AND origin = 'self'
@@ -183,6 +212,7 @@ class Cache:
           AND COALESCE(is_edited, 0) = 0
           AND COALESCE(is_locked, 0) = 0
           AND size_bytes >= ?
+          AND COALESCE(quota_charged_bytes, 0) > 0
           AND (lower(file_name) LIKE '%.jpg' OR lower(file_name) LIKE '%.jpeg')
         ORDER BY size_bytes DESC
     """
@@ -268,57 +298,227 @@ def human(num_bytes: float) -> str:
     return f"{num_bytes / 1_000_000:.1f} MB"
 
 
-def _set_exif_dims(exif: Image.Exif, width: int, height: int) -> None:
-    """Keep EXIF pixel dimensions truthful after a resize so viewers do not show stale sizes."""
-    sub = exif.get_ifd(0x8769)
-    if sub is not None:
-        sub[0xA002] = width
-        sub[0xA003] = height
-    for tag, value in ((0x0100, width), (0x0101, height)):
-        if tag in exif:
-            exif[tag] = value
+def _wait_for(check: Callable[[], bool], attempts: int | None = None, delay: float | None = None) -> bool:
+    """Retry a check until it passes or the attempts run out; True if it passed."""
+    attempts = WAIT_ATTEMPTS if attempts is None else attempts
+    delay = WAIT_DELAY if delay is None else delay
+    for n in range(attempts):
+        if check():
+            return True
+        if n < attempts - 1:
+            time.sleep(delay)
+    return False
 
 
-def compress_jpeg(src: Path, dst: Path, *, quality: int, max_mp: float, mtime_ms: int | None = None) -> tuple[int, int]:
-    """Re-encode a JPEG: cap resolution, lower quality, keep EXIF and color profile.
+def has_mpf(path: Path) -> bool:
+    """Whether the JPEG carries a Multi-Picture Format block (what blocks Storage saver)."""
+    with path.open("rb") as handle:
+        return b"MPF\x00" in handle.read(256 * 1024)
+
+
+def strip_mpf(buf: bytes) -> bytes:
+    """Losslessly drop the APP2 MPF segment and everything after the primary image.
+
+    Sony and Android cameras append a second, preview-sized JPEG after the main
+    one. Google's Storage saver refuses such files, so cutting the MPF header and
+    that trailer makes the photo eligible without touching a single pixel or any
+    other metadata. Everything after the first start-of-scan is entropy data in
+    which every 0xFF is stuffed, so the first end-of-image marker is the primary's.
+
+    Raises:
+        ValueError: The bytes are not a JPEG this parser understands.
+    """
+    if buf[:2] != b"\xff\xd8":
+        raise ValueError("not a JPEG")
+    out = bytearray(buf[:2])
+    i = 2
+    try:
+        while True:
+            if buf[i] != 0xFF:
+                raise ValueError(f"bad marker at byte {i}")
+            if buf[i + 1] == 0xFF:  # fill byte before a marker is legal
+                i += 1
+                continue
+            marker = buf[i + 1]
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # standalone markers carry no length
+                out += buf[i : i + 2]
+                i += 2
+                continue
+            length = struct.unpack(">H", buf[i + 2 : i + 4])[0]
+            segment = buf[i : i + 2 + length]
+            if marker == 0xDA:
+                end = buf.index(b"\xff\xd9", i + 2 + length) + 2
+                out += buf[i:end]
+                return bytes(out)
+            if not (marker == 0xE2 and segment[4:8] == b"MPF\x00"):
+                out += segment
+            i += 2 + length
+    except (IndexError, struct.error) as exc:
+        raise ValueError("truncated JPEG") from exc
+
+
+def strip_file(src: Path, dst: Path, *, mtime_ms: int | None = None) -> None:
+    """Write the MPF-free version of a JPEG, atomically."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".part")
+    tmp.write_bytes(strip_mpf(src.read_bytes()))
+    tmp.replace(dst)
+    _touch(dst, mtime_ms)
+
+
+def patch_exif_dims(exif: bytes, width: int, height: int) -> bytes:
+    """Rewrite the pixel-dimension tags inside a raw EXIF blob, in place.
+
+    Pillow's own EXIF re-serialization moves the Sony MakerNote, whose internal
+    pointers are absolute offsets, so the camera data would silently break. The
+    in-place patch overwrites only the four dimension values and keeps every
+    other byte and offset identical. A blob that cannot be parsed is returned
+    unchanged: stale dimensions are cosmetic, a damaged MakerNote is not.
+    """
+    blob = bytearray(exif)
+    base = 6 if blob.startswith(b"Exif\x00\x00") else 0
+    endian = "<" if blob[base : base + 2] == b"II" else ">"
+
+    def entries(ifd: int) -> Iterator[tuple[int, int, int, int]]:
+        count = struct.unpack_from(endian + "H", blob, base + ifd)[0]
+        for n in range(count):
+            pos = base + ifd + 2 + 12 * n
+            tag, kind, cnt = struct.unpack_from(endian + "HHI", blob, pos)
+            yield tag, kind, cnt, pos + 8
+
+    targets = {0x0100: width, 0x0101: height, 0xA002: width, 0xA003: height}
+    try:
+        ifd0 = struct.unpack_from(endian + "I", blob, base + 4)[0]
+        ifds = [ifd0] + [struct.unpack_from(endian + "I", blob, pos)[0] for tag, _, _, pos in entries(ifd0) if tag == 0x8769]
+        for ifd in ifds:
+            for tag, kind, cnt, value_pos in entries(ifd):
+                if tag in targets and cnt == 1 and kind in (3, 4):
+                    struct.pack_into(endian + ("H" if kind == 3 else "I"), blob, value_pos, targets[tag])
+    except struct.error:
+        return exif
+    return bytes(blob)
+
+
+def _touch(path: Path, mtime_ms: int | None) -> None:
+    """Set the file time to the capture time so clients that fall back to it sort correctly."""
+    if mtime_ms:
+        seconds = mtime_ms / 1000
+        os.utime(path, (seconds, seconds))
+
+
+def compress_jpeg(
+    src: Path, dst: Path, *, quality: int, max_mp: float, target_mb: float = DEFAULT_TARGET_MB, mtime_ms: int | None = None
+) -> tuple[int, int, int]:
+    """Re-encode a JPEG: cap resolution, lower quality, keep every metadata block.
 
     Re-encoding with Pillow drops the Multi-Picture Format (MPF) trailer that
     Sony and Android cameras append, which is exactly what makes Google's
-    Storage saver refuse these files. EXIF (date, GPS, camera) and the ICC
-    profile are carried over. Pixels are never rotated, so the Orientation tag
-    stays valid.
+    Storage saver refuse these files. EXIF (with the MakerNote byte-exact), XMP
+    and the ICC profile are carried over verbatim. Pixels are never rotated, so
+    the Orientation tag stays valid. If the result exceeds the budget, the
+    quality steps down through QUALITY_STEPS; resolution is never reduced further.
 
     Args:
         src: Original JPEG.
         dst: Output path, written atomically.
-        quality: JPEG quality 1-100.
+        quality: Starting JPEG quality 1-100.
         max_mp: Downscale only when the image exceeds this many megapixels.
-        mtime_ms: If given, set the output mtime to this capture time so
-            clients that fall back to file time still sort correctly.
+        target_mb: Size budget in MB (decimal) that triggers the quality step-down.
+        mtime_ms: If given, set the output mtime to this capture time.
 
     Returns:
-        Output (width, height).
+        Output (width, height, quality actually used).
     """
     with Image.open(src) as im:
         if getattr(im, "n_frames", 1) > 1:
             im.seek(0)
-        exif = im.getexif()
-        icc = im.info.get("icc_profile")
+        extras: dict[str, Any] = {key: im.info[key] for key in ("xmp", "icc_profile") if im.info.get(key)}
+        exif: bytes = im.info.get("exif", b"")
+        if im.mode != "RGB":
+            extras.pop("icc_profile", None)  # a CMYK or grayscale profile does not describe the RGB pixels written below
         out = im if im.mode == "RGB" else im.convert("RGB")
         width, height = out.size
         if width * height > max_mp * 1_000_000:
             scale = math.sqrt(max_mp * 1_000_000 / (width * height))
             width, height = int(width * scale), int(height * scale)
             out = out.resize((width, height), Image.Resampling.LANCZOS)
-            _set_exif_dims(exif, width, height)
+        if exif:
+            extras["exif"] = patch_exif_dims(exif, width, height)
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".part")
-        out.save(tmp, "JPEG", quality=quality, optimize=True, progressive=True, subsampling="4:2:0", exif=exif, icc_profile=icc)
+        used = quality
+        for used in [quality, *(q for q in QUALITY_STEPS if q < quality)]:
+            out.save(tmp, "JPEG", quality=used, optimize=True, progressive=True, subsampling="4:2:0", **extras)
+            if tmp.stat().st_size <= target_mb * 1_000_000:
+                break
     tmp.replace(dst)
-    if mtime_ms:
-        seconds = mtime_ms / 1000
-        os.utime(dst, (seconds, seconds))
-    return width, height
+    _touch(dst, mtime_ms)
+    return width, height, used
+
+
+def make_copy(src: Path, dst: Path, cfg: Config, mtime_ms: int | None = None) -> tuple[int, int, int]:
+    """Produce the smaller copy in the configured mode; returns (width, height, quality or 0 for strip)."""
+    if cfg.mode is Mode.STRIP:
+        if not has_mpf(src):
+            raise SkipItem("no MPF block, nothing to strip")
+        strip_file(src, dst, mtime_ms=mtime_ms)
+        with Image.open(dst) as im:
+            return im.size[0], im.size[1], 0
+    return compress_jpeg(src, dst, quality=cfg.quality, max_mp=cfg.max_mp, target_mb=cfg.target_mb, mtime_ms=mtime_ms)
+
+
+def _thumb(path: Path) -> Image.Image:
+    """256 px square RGB sample.
+
+    Full decode on purpose: JPEG draft mode on a 33 MP MPO shifted the colours by
+    about 3/255 on a real Sony file, which made the pixel check useless.
+    """
+    with Image.open(path) as im:
+        if getattr(im, "n_frames", 1) > 1:
+            im.seek(0)
+        return im.convert("RGB").resize((256, 256), Image.Resampling.BILINEAR)
+
+
+def check_copy(src: Path, dst: Path, cfg: Config) -> list[list[Any]]:
+    """Outlier guard: compare a fresh copy with its original before anything is uploaded.
+
+    A bug in resizing, metadata handling or the encoder would otherwise be
+    uploaded 1000 times before anyone noticed. Each check returns
+    ``[label, ok, detail]``; any failure must stop the run.
+    """
+    checks: list[list[Any]] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        checks.append([LOCAL_PREFIX + label, bool(ok), detail])
+
+    src_size, dst_size = src.stat().st_size, dst.stat().st_size
+    check("smaller than original", dst_size < src_size, f"{human(src_size)} to {human(dst_size)}")
+    if cfg.mode is Mode.COMPRESS:
+        budget = cfg.target_mb * 1_000_000 * SIZE_SLACK
+        check("within size budget", dst_size <= budget, f"{human(dst_size)} vs {cfg.target_mb:g} MB target")
+    with Image.open(src) as a, Image.open(dst) as b:
+        if getattr(a, "n_frames", 1) > 1:
+            a.seek(0)
+        ratio = (b.size[0] / b.size[1]) / (a.size[0] / a.size[1])
+        check("aspect ratio kept", abs(ratio - 1) <= ASPECT_TOLERANCE, f"{a.size[0]}x{a.size[1]} to {b.size[0]}x{b.size[1]}")
+        exif_a, exif_b = a.getexif(), b.getexif()
+        check("orientation kept", exif_a.get(0x0112) == exif_b.get(0x0112))
+        sub_a, sub_b = exif_a.get_ifd(0x8769), exif_b.get_ifd(0x8769)
+        pairs = [
+            ("Make", exif_a.get(0x010F), exif_b.get(0x010F)),
+            ("Model", exif_a.get(0x0110), exif_b.get(0x0110)),
+            ("DateTimeOriginal", sub_a.get(0x9003), sub_b.get(0x9003)),
+            ("OffsetTimeOriginal", sub_a.get(0x9011), sub_b.get(0x9011)),
+            ("LensModel", sub_a.get(0xA434), sub_b.get(0xA434)),
+            ("MakerNote", sub_a.get(0x927C), sub_b.get(0x927C)),
+            ("GPS", dict(exif_a.get_ifd(0x8825)), dict(exif_b.get_ifd(0x8825))),
+            ("XMP", bool(a.info.get("xmp")), bool(b.info.get("xmp"))),
+        ]
+        changed = [name for name, before, after in pairs if before != after]
+        check("camera metadata identical", not changed, ", ".join(changed))
+    drift = max(ImageStat.Stat(ImageChops.difference(_thumb(src), _thumb(dst))).mean)
+    check("pixels match original", drift <= DRIFT_THRESHOLD, f"mean drift {drift:.2f} of 255")
+    return checks
 
 
 def _original_url(payload: dict[str, Any]) -> str:
@@ -329,7 +529,7 @@ def _original_url(payload: dict[str, Any]) -> str:
         raise RuntimeError("download response has no URL block") from exc
     # "6" is the untouched original, "5" is the version with edits applied.
     url = node.get("6") or node.get("5")
-    if not isinstance(url, str) or not url.startswith("http"):
+    if not isinstance(url, str) or not url.startswith("https://"):
         raise RuntimeError("download response has no usable URL")
     return url
 
@@ -371,20 +571,58 @@ def album_media_keys(web: Any, album_key: str) -> set[str]:
     return keys
 
 
+ALBUM_URL = re.compile(r"photos\.google\.com/(?:u/\d+/)?(?:album|share)/([A-Za-z0-9_-]+)")
+SHORT_LINK_HOSTS = ("photos.app.goo.gl", "goo.gl")
+
+
+def resolve_album(albums: list[AlbumRef], spec: str) -> AlbumRef:
+    """Turn what the user typed into exactly one album.
+
+    Accepts an exact title (case-insensitive), a raw album media key, a
+    photos.google.com album or share URL, or a photos.app.goo.gl short link.
+
+    Raises:
+        ValueError: Nothing or more than one album matches. The message says how to fix it.
+    """
+    spec = spec.strip()
+    if spec.startswith("http"):
+        if urlparse(spec).hostname in SHORT_LINK_HOSTS:
+            spec = requests.head(spec, allow_redirects=True, timeout=15).url
+        match = ALBUM_URL.search(spec)
+        if not match:
+            raise ValueError(f"no album key found in link {spec!r}")
+        spec = match.group(1)
+    for album in albums:
+        if album.key == spec:
+            return album
+    same_title = [a for a in albums if a.title.casefold() == spec.casefold()]
+    if len(same_title) == 1:
+        return same_title[0]
+    if same_title:
+        keys = ", ".join(a.key for a in same_title)
+        raise ValueError(f"{len(same_title)} albums are titled {spec!r}; pass one of these keys or its link instead: {keys}")
+    close = difflib.get_close_matches(spec, [a.title for a in albums], n=3, cutoff=0.5)
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    raise ValueError(f"no album matches {spec!r}.{hint}")
+
+
 def build_album_index(web: Any) -> dict[str, list[AlbumRef]]:
     """Map every media key to the albums that contain it.
 
-    Deliberate shortcut: reads every album in full on each run. Ceiling is a few
+    Raises RuntimeError if any album cannot be read. Deliberate shortcut: reads every album in full on each run. Ceiling is a few
     hundred albums before startup gets slow; cache per album by modified time
     when a library crosses that.
     """
     index: dict[str, list[AlbumRef]] = {}
     for album in list_albums(web):
         try:
-            for key in album_media_keys(web, album.key):
-                index.setdefault(key, []).append(album)
-        except Exception as exc:  # noqa: BLE001 - albums shared with us may refuse reads
-            console.print(f"[yellow]skipped album {album.title!r}: {exc}[/yellow]")
+            keys = album_media_keys(web, album.key)
+        except Exception as exc:
+            # Fail closed: a photo in an album we could not read would look album-less, so its copy
+            # would skip that album and the original would then be trashed out of it.
+            raise RuntimeError(f"could not read album {album.title!r} ({album.key}): {exc}") from exc
+        for key in keys:
+            index.setdefault(key, []).append(album)
     return index
 
 
@@ -401,6 +639,7 @@ class Shrinker:
         self.cache = cache
         self.cfg = cfg
         self._album_index: dict[str, list[AlbumRef]] | None = None
+        self.skipped_shared = 0
 
     # ---- selection
 
@@ -415,7 +654,15 @@ class Shrinker:
         rows = self.cache.candidates(int(sel.min_mb * 1_000_000))
         own_copies = self.state.new_keys()
         index = self.album_index()
-        wanted = {a.casefold() for a in sel.albums}
+        wanted: set[str] = set()
+        if sel.albums:
+            if self.web is None:
+                fail("--album needs cookies.txt (web API). See README.md, section Authentication.")
+            try:
+                wanted = {resolve_album(list_albums(self.web), spec).key for spec in sel.albums}
+            except ValueError as exc:
+                fail(str(exc))
+        self.skipped_shared = 0
         picked: list[Item] = []
         for row in rows:
             key = row["media_key"]
@@ -424,11 +671,16 @@ class Shrinker:
             if sel.ids and key not in sel.ids:
                 continue
             item = self.state.get(key) or item_from_row(row)
-            if item.stage in {"trashed", "skipped", "rolled_back"} and not sel.ids:
+            if item.stage == "trashed" or (item.stage in SIDE_STATES and not sel.ids):
                 continue
-            if item.stage == "candidate":
-                item.albums = [asdict(a) for a in index.get(key, [])]
-            if wanted and not wanted & {a["title"].casefold() for a in item.albums}:
+            if item.stage in SIDE_STATES:  # only reachable with --id: start the photo over
+                item = item_from_row(row)
+            if STAGES.index(item.stage) < STAGES.index("uploaded"):
+                item.albums = [asdict(a) for a in index.get(key, [])]  # memberships may have changed since the last run
+            if wanted and not wanted & {a["key"] for a in item.albums}:
+                continue
+            if not sel.include_shared and any(a["shared"] for a in item.albums):
+                self.skipped_shared += 1
                 continue
             picked.append(item)
             if sel.limit and len(picked) >= sel.limit:
@@ -451,6 +703,8 @@ class Shrinker:
         """
         if item.stage in SIDE_STATES:
             return True
+        if item.stage == "compressed" and not item.new_media_key and item.made_with != self._signature():
+            item.stage = "downloaded"  # settings changed since the copy was made and nothing is uploaded yet: re-make it
         while STAGES.index(item.stage) < STAGES.index(last):
             nxt = STAGES[STAGES.index(item.stage) + 1]
             if confirm and nxt in ("uploaded", "trashed") and not confirm(item, "upload" if nxt == "uploaded" else "trash"):
@@ -462,12 +716,17 @@ class Shrinker:
                 self.state.put(item)
                 return True
             except Exception as exc:  # noqa: BLE001 - any failure must park the item, not crash the batch
-                item.error = f"{type(exc).__name__}: {exc}"
+                # Signed download URLs inside error text would otherwise land in state.json and the console.
+                item.error = re.sub(r"https?://\S+", "<url>", f"{type(exc).__name__}: {exc}")
                 self.state.put(item)
                 return False
             item.stage, item.error = nxt, ""
             self.state.put(item)
         return True
+
+    def _signature(self) -> str:
+        c = self.cfg
+        return f"{c.mode}:{c.quality}:{c.max_mp}:{c.target_mb}"
 
     # ---- stages
 
@@ -520,25 +779,33 @@ class Shrinker:
         if has_gain_map(src):
             raise SkipItem("Ultra HDR gain map would be lost by re-encoding")
         dst = self.cfg.workdir / "compressed" / src.name
-        width, height = compress_jpeg(src, dst, quality=self.cfg.quality, max_mp=self.cfg.max_mp, mtime_ms=item.utc_ms)
+        mpf = has_mpf(src)
+        width, height, quality = make_copy(src, dst, self.cfg, item.utc_ms)
         size = dst.stat().st_size
-        if size > item.size_bytes * (1 - self.cfg.min_saving):
+        if self.cfg.mode is Mode.COMPRESS and size > item.size_bytes * (1 - self.cfg.min_saving):
             dst.unlink(missing_ok=True)
             raise SkipItem(f"gain too small: {human(item.size_bytes)} to {human(size)} (needs {self.cfg.min_saving:.0%})")
         item.compressed_path = str(dst)
+        item.made_with = self._signature()
         item.new_size = size
         item.new_dedup_key = dedup_key_of(sha1_file(dst))
-        item.note = f"{width}x{height}"
+        item.note = f"{width}x{height}" + (f" Q{quality}" if quality else " stripped") + (", had MPF" if mpf else ", no MPF")
+        item.checks = check_copy(src, dst, self.cfg)
+        failed = [c[0].removeprefix(LOCAL_PREFIX) for c in item.checks if not c[1]]
+        if failed:
+            raise RuntimeError(f"outlier, not uploading ({', '.join(failed)}); inspect {dst}")
 
     def _to_uploaded(self, item: Item) -> None:
         if item.new_media_key:
             return
         path = Path(item.compressed_path)
+        if dedup_key_of(sha1_file(path)) != item.new_dedup_key:
+            raise RuntimeError(f"{path} changed after it was checked, refusing to upload it")
         # use_quota is always on: the point is honest accounting, not the unlimited-storage trick.
         result = self.gp.upload(
             target={path: {"hash": sha1_file(path), "filename": item.file_name}},
             use_quota=True,
-            saver=self.cfg.saver,
+            saver=self.cfg.saver or self.cfg.mode is Mode.STRIP,  # a stripped file only gains if Google recompresses it
             show_progress=False,
         )
         key = result.get(str(path.resolve())) or result.get(str(path))
@@ -577,25 +844,39 @@ class Shrinker:
             except Exception as exc:  # noqa: BLE001 - cosmetic loss, original stays restorable
                 item.warnings.append(f"could not carry over {label}: {exc}")
 
+    def _row_where(self, media_key: str, predicate: Callable[[sqlite3.Row | None], bool]) -> sqlite3.Row | None:
+        """Poll the library until the row satisfies the predicate (it is eventually consistent)."""
+
+        def settled() -> bool:
+            self.cache.sync(show_progress=False)
+            return predicate(self.cache.row(media_key))
+
+        _wait_for(settled)
+        return self.cache.row(media_key)
+
+    def _in_album(self, media_key: str, album: AlbumRef) -> bool:
+        return media_key in album_media_keys(self.web, album.key)
+
     def _to_verified(self, item: Item) -> None:
-        self.cache.sync(show_progress=False)
-        row = self.cache.row(item.new_media_key)
-        checks: list[list[Any]] = []
+        row = self._row_where(item.new_media_key, lambda r: r is not None and not r["trash_timestamp"])
+        checks = [c for c in item.checks if c[0].startswith(LOCAL_PREFIX)]  # keep the pre-upload guard results
 
         def check(label: str, ok: bool, detail: str = "") -> None:
             checks.append([label, bool(ok), detail])
 
         check("copy exists in library", row is not None and not row["trash_timestamp"])
         if row is not None:
+            if not (self.cfg.saver or self.cfg.mode is Mode.STRIP):  # Google recompresses saver uploads, so the bytes legitimately differ
+                check("uploaded the checked bytes", row["dedup_key"] == item.new_dedup_key and row["size_bytes"] == item.new_size)
             check("copy is smaller", row["size_bytes"] < item.size_bytes, f"{human(item.size_bytes)} to {human(row['size_bytes'])}")
             check("capture time kept", abs((row["utc_timestamp"] or 0) - item.utc_ms) <= TS_TOLERANCE_MS)
             check("file name kept", row["file_name"] == item.file_name, row["file_name"])
         for album in (AlbumRef(**a) for a in item.albums):
-            check(f"in album {album.title}", item.new_media_key in album_media_keys(self.web, album.key))
+            check(f"in album {album.title}", _wait_for(partial(self._in_album, item.new_media_key, album)))
         item.checks = checks
         failed = [c[0] for c in checks if not c[1]]
         if failed:
-            raise VerifyError("failed: " + ", ".join(failed))
+            raise RuntimeError("failed: " + ", ".join(failed))
 
     def _to_trashed(self, item: Item) -> None:
         # Invariants that must hold before the only destructive call in this tool.
@@ -603,9 +884,23 @@ class Shrinker:
             raise RuntimeError("no distinct verified copy, refusing to trash the original")
         if not item.checks or not all(c[1] for c in item.checks):
             raise RuntimeError("verification checks missing or failing, refusing to trash the original")
+        # The downloaded original is the last local backup, so it must be intact before the cloud one goes.
+        backup = Path(item.original_path)
+        if not backup.is_file() or backup.stat().st_size != item.size_bytes:
+            raise RuntimeError(f"local backup {backup} is missing or changed, refusing to trash the original")
+        if len(item.dedup_key) == SHA1_B64_LEN and dedup_key_of(sha1_file(backup)) != item.dedup_key:
+            raise RuntimeError(f"local backup {backup} no longer matches the original SHA-1, refusing to trash the original")
+        # The checks on file are only as fresh as the last run, so look at the library again right now.
+        row = self._row_where(item.new_media_key, lambda r: r is not None and not r["trash_timestamp"])
+        if row is None or row["trash_timestamp"]:
+            raise RuntimeError("the copy is no longer in the library (trashed or deleted?), refusing to trash the original")
+        missing = [a["title"] for a in item.albums if not self._in_album(item.new_media_key, AlbumRef(**a))]
+        if missing:
+            raise RuntimeError(f"the copy is no longer in album {', '.join(missing)}, refusing to trash the original")
+        item.trash_requested = True
+        self.state.put(item)
         self.gp.api.move_remote_media_to_trash(dedup_keys=[item.dedup_key])
-        self.cache.sync(show_progress=False)
-        row = self.cache.row(item.media_key)
+        row = self._row_where(item.media_key, lambda r: r is None or bool(r["trash_timestamp"]))
         if row is not None and not row["trash_timestamp"]:
             raise RuntimeError("trash call returned but the original is still in the library")
 
@@ -617,8 +912,10 @@ class Shrinker:
         Order matters: the original is restored first so there is never a moment
         with zero copies in the library.
         """
-        if item.stage == "trashed":
+        if item.stage == "trashed" or item.trash_requested:
             self.gp.api.restore_from_trash(dedup_keys=[item.dedup_key])
+            if self._row_where(item.media_key, lambda r: r is not None and not r["trash_timestamp"]) is None:
+                raise RuntimeError("the original is not back in the library yet, not trashing the copy")
         if item.new_dedup_key and item.new_media_key:
             self.gp.api.move_remote_media_to_trash(dedup_keys=[item.new_dedup_key])
         item.stage, item.error, item.note = "rolled_back", "", "undone by user"
@@ -714,11 +1011,24 @@ app = typer.Typer(
 )
 
 MinSize = Annotated[float, typer.Option("--min-size-mb", help="Only photos at or above this size, in MB (decimal).")]
-AlbumOpt = Annotated[list[str] | None, typer.Option("--album", "-a", help="Only photos in this album title. Repeatable.")]
+AlbumOpt = Annotated[
+    list[str] | None,
+    typer.Option("--album", "-a", help="Only photos in this album: title, album key, photos.google.com album/share URL or photos.app.goo.gl link. Repeatable."),
+]
 IdOpt = Annotated[list[str] | None, typer.Option("--id", help="Only this library media key. Repeatable. Also re-opens skipped or undone items.")]
 LimitOpt = Annotated[int | None, typer.Option("--limit", "-n", help="Process at most N photos.")]
-QualityOpt = Annotated[int, typer.Option("--quality", min=50, max=100, help="JPEG quality of the compressed copy.")]
-MaxMpOpt = Annotated[float, typer.Option("--max-mp", help="Downscale only if above this many megapixels (Google's own Storage saver uses 16).")]
+QualityOpt = Annotated[int, typer.Option("--quality", min=50, max=100, help="Starting JPEG quality; steps down if the copy exceeds --target-mb.")]
+MaxMpOpt = Annotated[
+    float, typer.Option("--max-mp", help="Downscale only if above this many megapixels. 8 covers A4 at 300 DPI; 12 gives about 240 DPI on 30x30 cm.")
+]
+TargetMbOpt = Annotated[float, typer.Option("--target-mb", min=0.2, help="Size budget per copy in MB. Quality steps down to stay under it.")]
+ModeOpt = Annotated[
+    Mode, typer.Option("--mode", help="compress: downscale and re-encode. strip: lossless, only drops the MPF block (uploads as Storage saver).")
+]
+KeepGoingOpt = Annotated[bool, typer.Option("--keep-going", help="Continue with the next photo after a failure. Default is to halt at the first one.")]
+SharedOpt = Annotated[
+    bool, typer.Option("--include-shared", help="Also process photos that sit in albums shared with others (adding the copy may notify members).")
+]
 MinSavingOpt = Annotated[float, typer.Option("--min-saving", min=0.0, max=0.95, help="Skip photos where compression saves less than this fraction.")]
 SaverOpt = Annotated[bool, typer.Option("--saver/--original", help="Upload the copy as Storage saver (Google recompresses) or Original quality.")]
 HashOpt = Annotated[bool, typer.Option("--hash-check/--no-hash-check", help="Require the download to match the stored SHA-1.")]
@@ -748,12 +1058,27 @@ def main(
     ctx.obj = Settings(workdir, auth_data, cookies.expanduser() if cookies else None, account_index, verbose)
 
 
-def _cfg(st: Settings, quality: int, max_mp: float, min_saving: float, saver: bool, hash_check: bool) -> Config:
-    return Config(st.workdir, quality, max_mp, min_saving, saver, hash_check)
+def _cfg(
+    st: Settings,
+    quality: int,
+    max_mp: float,
+    min_saving: float,
+    saver: bool,
+    hash_check: bool,
+    target_mb: float = DEFAULT_TARGET_MB,
+    mode: Mode = Mode.COMPRESS,
+    keep_going: bool = False,
+) -> Config:
+    return Config(st.workdir, quality, max_mp, min_saving, saver, hash_check, target_mb, mode, keep_going)
 
 
-def _sel(min_mb: float, albums: list[str] | None, ids: list[str] | None, limit: int | None) -> Selection:
-    return Selection(min_mb, albums or [], ids or [], limit)
+def _sel(min_mb: float, albums: list[str] | None, ids: list[str] | None, limit: int | None, include_shared: bool = False) -> Selection:
+    return Selection(min_mb, albums or [], ids or [], limit, include_shared)
+
+
+def _note_shared(sh: Shrinker) -> None:
+    if sh.skipped_shared:
+        console.print(f"[yellow]{sh.skipped_shared} photos skipped because they sit in shared albums. Add --include-shared to process them.[/yellow]")
 
 
 def _items_table(items: list[Item], title: str) -> Table:
@@ -783,14 +1108,16 @@ def scan(
     min_size_mb: MinSize = 5.0,
     album: AlbumOpt = None,
     limit: LimitOpt = None,
+    include_shared: SharedOpt = False,
     sync: Annotated[bool, typer.Option("--sync/--no-sync", help="Refresh the local library cache first.")] = True,
     csv_path: Annotated[Path | None, typer.Option("--csv", help="Also write the list to this CSV.")] = None,
 ) -> None:
     """List big JPEGs that are candidates (read-only, changes nothing).
 
     Photos edited in Google Photos, motion photos, videos, locked-folder items,
-    and photos shared with you are excluded because re-uploading would lose or
-    break something.
+    photos shared with you, and photos already stored free (not charged to your
+    quota) are excluded because re-uploading would lose or break something, or
+    gain nothing. Photos in shared albums are listed only with --include-shared.
     """
     st: Settings = ctx.obj
     sh = st.shrinker(Config(st.workdir), need_web=False)
@@ -798,7 +1125,8 @@ def scan(
         sh.cache.sync()
     if sh.web is None:
         console.print("[yellow]No cookies configured: album column is empty. Albums are required for process/try/run.[/yellow]")
-    items = sh.select(_sel(min_size_mb, album, None, limit))
+    items = sh.select(_sel(min_size_mb, album, None, limit, include_shared))
+    _note_shared(sh)
     console.print(_items_table(items, f"{len(items)} candidates"))
     total = sum(i.size_bytes for i in items)
     console.print(f"total {human(total)}; counted against quota: {human(sum(i.quota_bytes for i in items))}")
@@ -853,24 +1181,28 @@ def try_(
     min_size_mb: MinSize = 5.0,
     album: AlbumOpt = None,
     ids: IdOpt = None,
-    quality: QualityOpt = 88,
-    max_mp: MaxMpOpt = 16.0,
+    quality: QualityOpt = DEFAULT_QUALITY,
+    max_mp: MaxMpOpt = DEFAULT_MAX_MP,
+    target_mb: TargetMbOpt = DEFAULT_TARGET_MB,
+    mode: ModeOpt = Mode.COMPRESS,
     min_saving: MinSavingOpt = 0.20,
     saver: SaverOpt = False,
     hash_check: HashOpt = True,
 ) -> None:
-    """Interactive dry run on a few photos with approval at every irreversible step.
+    """Interactive run on a few photos with approval at every irreversible step.
 
     For each photo: download and compress, show before and after, let you open
     both files, then ask before uploading. After upload it adds the copy to the
     same albums, runs the checks, and asks what to do with the original
-    (trash it, keep both, or undo). Pick photos from different albums to see
-    how album handling behaves, including shared albums.
+    (trash it, keep both, or undo). Start with one album you own, passed as
+    --album (title, key or link). Photos in shared albums are included here, but
+    you are warned before anything is added to one. The session stops at the
+    first photo that fails a check.
     """
     st: Settings = ctx.obj
-    sh = st.shrinker(_cfg(st, quality, max_mp, min_saving, saver, hash_check))
+    sh = st.shrinker(_cfg(st, quality, max_mp, min_saving, saver, hash_check, target_mb, mode))
     sh.cache.sync()
-    pool = sh.select(_sel(min_size_mb, album, ids, None))
+    pool = sh.select(_sel(min_size_mb, album, ids, None, include_shared=True))
     if not pool:
         fail("No candidates match.")
     picks = _pick_diverse(pool, count)
@@ -878,18 +1210,26 @@ def try_(
     for item in picks:
         console.rule(item.file_name)
         if not sh.advance(item, "compressed"):
-            console.print(f"[red]{item.error}[/red]")
-            continue
+            _halt(item)
+            break
         if item.stage == "skipped":
             console.print(f"[yellow]skipped: {item.note}[/yellow]")
             continue
         _review(sh, item)
+        shared = [a["title"] for a in item.albums if a["shared"]]
+        if shared and not typer.confirm(
+            f"Shared with others: {', '.join(shared)}. Adding the copy may notify members and its position in the album is not kept. Continue?",
+            default=False,
+        ):
+            console.print("Nothing uploaded. State saved, rerun to resume.")
+            continue
         if not typer.confirm("Upload the compressed copy and add it to the same albums?", default=False):
             console.print("Nothing uploaded. State saved, rerun to resume.")
             continue
         if not sh.advance(item, "verified"):
-            console.print(f"[red]{item.error}[/red]\nThe original is untouched. Run 'undo --id {item.media_key} --apply' to drop the copy.")
-            continue
+            _halt(item)
+            console.print(f"The original is untouched. Run 'undo --id {item.media_key} --apply' to drop the copy.")
+            break
         table = Table(title="Checks")
         table.add_column("check")
         table.add_column("result")
@@ -903,11 +1243,18 @@ def try_(
         choice = ask_choice("Original: [t]rash it, [k]eep both for now, [u]ndo (drop the copy)", "tku", "k")
         if choice == "t":
             ok = sh.advance(item, "trashed")
-            console.print("[green]original moved to trash (restorable for 60 days)[/green]" if ok else f"[red]{item.error}[/red]")
+            console.print("[green]original moved to trash (restorable for at least 30 days)[/green]" if ok else f"[red]{item.error}[/red]")
         elif choice == "u":
             sh.undo(item)
             console.print("Undone: copy trashed, original untouched.")
     _summary(sh.state)
+
+
+def _halt(item: Item) -> None:
+    """Explain why a run stopped at this photo and where to look."""
+    console.print(f"[red]Stopping at {item.file_name}: {item.error}[/red]")
+    if item.compressed_path:
+        console.print(f"Original: {item.original_path}\nCopy: {item.compressed_path}")
 
 
 def _summary(state: State) -> None:
@@ -920,6 +1267,7 @@ def _batch(st: Settings, cfg: Config, sel: Selection, *, apply: bool, trash: boo
     sh = st.shrinker(cfg)
     sh.cache.sync()
     items = sh.select(sel)
+    _note_shared(sh)
     if not items:
         console.print("Nothing to do.")
         return
@@ -929,18 +1277,31 @@ def _batch(st: Settings, cfg: Config, sel: Selection, *, apply: bool, trash: boo
     elif not yes:
         typer.confirm(f"Upload compressed copies for {len(items)} photos?", abort=True)
     last = "verified" if apply else "compressed"
+    halted = False
     for item in track(items, description="processing"):
-        if not sh.advance(item, last):
-            console.print(f"[red]{item.file_name}: {item.error}[/red]")
+        if not sh.advance(item, last) and item.error:
+            _halt(item)
+            if not cfg.keep_going:
+                halted = True
+                console.print("[red]Halted: nothing after this photo was touched and nothing will be trashed. Fix or inspect it, or pass --keep-going.[/red]")
+                break
     ready = [i for i in items if i.stage == "verified"]
     for stage in ("compressed", "skipped", "verified", "trashed"):
         count = sum(1 for i in items if i.stage == stage)
         if count:
             console.print(f"{stage}: {count}")
-    if trash and apply and ready and (yes or typer.confirm(f"Move {len(ready)} verified originals to the Google Photos trash (restorable for 60 days)?")):
+    if (
+        trash
+        and apply
+        and not halted
+        and ready
+        and (yes or typer.confirm(f"Move {len(ready)} verified originals to the Google Photos trash (restorable for at least 30 days)?"))
+    ):
         for item in track(ready, description="trashing"):
             if not sh.advance(item, "trashed"):
                 console.print(f"[red]{item.file_name}: {item.error}[/red]")
+                if not cfg.keep_going:
+                    break
     _summary(sh.state)
 
 
@@ -951,17 +1312,22 @@ def process(
     album: AlbumOpt = None,
     ids: IdOpt = None,
     limit: LimitOpt = None,
+    include_shared: SharedOpt = False,
+    keep_going: KeepGoingOpt = False,
     apply: Annotated[bool, typer.Option("--apply", help="Actually upload. Without it, only download and compress locally.")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
-    quality: QualityOpt = 88,
-    max_mp: MaxMpOpt = 16.0,
+    quality: QualityOpt = DEFAULT_QUALITY,
+    max_mp: MaxMpOpt = DEFAULT_MAX_MP,
+    target_mb: TargetMbOpt = DEFAULT_TARGET_MB,
+    mode: ModeOpt = Mode.COMPRESS,
     min_saving: MinSavingOpt = 0.20,
     saver: SaverOpt = False,
     hash_check: HashOpt = True,
 ) -> None:
     """Download, compress, upload, re-album and verify. Never trashes anything."""
     st: Settings = ctx.obj
-    _batch(st, _cfg(st, quality, max_mp, min_saving, saver, hash_check), _sel(min_size_mb, album, ids, limit), apply=apply, trash=False, yes=yes)
+    cfg = _cfg(st, quality, max_mp, min_saving, saver, hash_check, target_mb, mode, keep_going)
+    _batch(st, cfg, _sel(min_size_mb, album, ids, limit, include_shared), apply=apply, trash=False, yes=yes)
 
 
 @app.command()
@@ -971,17 +1337,22 @@ def run(
     album: AlbumOpt = None,
     ids: IdOpt = None,
     limit: LimitOpt = None,
+    include_shared: SharedOpt = False,
+    keep_going: KeepGoingOpt = False,
     apply: Annotated[bool, typer.Option("--apply", help="Actually upload and trash. Without it, local dry run.")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip both confirmation prompts.")] = False,
-    quality: QualityOpt = 88,
-    max_mp: MaxMpOpt = 16.0,
+    quality: QualityOpt = DEFAULT_QUALITY,
+    max_mp: MaxMpOpt = DEFAULT_MAX_MP,
+    target_mb: TargetMbOpt = DEFAULT_TARGET_MB,
+    mode: ModeOpt = Mode.COMPRESS,
     min_saving: MinSavingOpt = 0.20,
     saver: SaverOpt = False,
     hash_check: HashOpt = True,
 ) -> None:
     """The whole loop: process, then trash the originals that passed every check."""
     st: Settings = ctx.obj
-    _batch(st, _cfg(st, quality, max_mp, min_saving, saver, hash_check), _sel(min_size_mb, album, ids, limit), apply=apply, trash=True, yes=yes)
+    cfg = _cfg(st, quality, max_mp, min_saving, saver, hash_check, target_mb, mode, keep_going)
+    _batch(st, cfg, _sel(min_size_mb, album, ids, limit, include_shared), apply=apply, trash=True, yes=yes)
 
 
 @app.command()
@@ -991,7 +1362,7 @@ def trash(
     apply: Annotated[bool, typer.Option("--apply")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
 ) -> None:
-    """Move originals of verified photos to the Google Photos trash (restorable for 60 days)."""
+    """Move originals of verified photos to the Google Photos trash (restorable for at least 30 days)."""
     st: Settings = ctx.obj
     sh = st.shrinker(Config(st.workdir))
     ready = [i for i in sh.state.items.values() if i.stage == "verified" and (not ids or i.media_key in ids)]
@@ -1005,7 +1376,10 @@ def trash(
     if not yes:
         typer.confirm("Move these originals to the trash?", abort=True)
     for item in ready:
-        console.print(f"{item.file_name}: " + ("trashed" if sh.advance(item, "trashed") else f"[red]{item.error}[/red]"))
+        done = sh.advance(item, "trashed")
+        console.print(f"{item.file_name}: " + ("trashed" if done else f"[red]{item.error}[/red]"))
+        if not done:
+            break
 
 
 @app.command()
@@ -1027,6 +1401,49 @@ def undo(
             continue
         sh.undo(item)
         console.print(f"{item.file_name}: undone")
+
+
+@app.command()
+def local(
+    ctx: typer.Context,
+    files: Annotated[list[Path], typer.Argument(help="JPEG files to shrink.", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Folder for the copies.")] = Path("shrunk"),
+    quality: QualityOpt = DEFAULT_QUALITY,
+    max_mp: MaxMpOpt = DEFAULT_MAX_MP,
+    target_mb: TargetMbOpt = DEFAULT_TARGET_MB,
+    mode: ModeOpt = Mode.COMPRESS,
+) -> None:
+    """Shrink local files with the exact pipeline and checks used on Google Photos. No account needed.
+
+    Use it to vet the settings on your own photos before touching the library.
+    Exits non-zero if any copy fails a check.
+    """
+    st: Settings = ctx.obj
+    cfg = _cfg(st, quality, max_mp, 0.0, False, True, target_mb, mode)
+    table = Table(title=f"{mode.value} to {out}")
+    for col in ("file", "size", "result", "dims", "checks"):
+        table.add_column(col)
+    bad = 0
+    for src in files:
+        dst = out / f"{src.stem}_{mode.value}.jpg"
+        try:
+            width, height, used = make_copy(src, dst, cfg)
+        except SkipItem as exc:
+            table.add_row(src.name, human(src.stat().st_size), f"skipped: {exc}", "-", "-")
+            continue
+        checks = check_copy(src, dst, cfg)
+        failed = [c[0].removeprefix(LOCAL_PREFIX) for c in checks if not c[1]]
+        bad += bool(failed)
+        table.add_row(
+            src.name,
+            human(src.stat().st_size),
+            f"{human(dst.stat().st_size)}" + (f" Q{used}" if used else ""),
+            f"{width}x{height}",
+            "[red]FAIL: " + ", ".join(failed) + "[/red]" if failed else "[green]all ok[/green]",
+        )
+    console.print(table)
+    if bad:
+        raise typer.Exit(1)
 
 
 @app.command()

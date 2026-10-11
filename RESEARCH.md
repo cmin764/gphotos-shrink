@@ -1,62 +1,120 @@
 # Research notes and handoff
 
-For the next agent (or for you in a month). Read this, then `README.md`, run `pytest test_offline.py`, then pick from the backlog. The most valuable next step is not code, it is one live `try` run, because the tool's assumptions about Google are all unverified.
+For the next agent (or for you in a month). Read this, then `README.md`, run `pytest`, then follow the pilot protocol in section 6. The most valuable next step is not code, it is one live `try` on two photos of one album, because every assumption about Google's side is still unverified.
+
+## 0. Settled and open
+
+| Decided | Where |
+|---|---|
+| Default copy: 8 MP, Q85, 2 MB budget, quality-only step-down; Pillow, 4:2:0 progressive, no new encoder | section 4 |
+| Verbatim EXIF (dimensions patched in place), XMP and ICC kept | section 4 |
+| Every copy passes the outlier guard before upload; a batch halts at the first failure and then trashes nothing | README |
+| Trash re-checks the copy, its albums and the local original at that moment; unreadable albums stop the run | section 8 |
+| Shared albums skipped unless `--include-shared`; `try` asks first | section 3 |
+| Only own, unedited, quota-charged JPEGs of at least 5 MB | README |
+| Trash is "at least 30 days"; nothing is ever deleted permanently | section 3 |
+
+| Still open | Resolved by |
+|---|---|
+| Does Google accept the calls (A1 to A5, A7 to A9, A14) | live pilot, section 6 |
+| Does Storage saver recompress a stripped file (A13), and does the dedup key change | pilot step 7 |
+| Do ARW masters exist locally | section 9, question 1 |
+| `try` end-to-end upload path is untested offline | next test round |
 
 ## 1. The case
 
-- Owner: Cosmin. Camera: Sony A7 IV. Example file `CMN08911.JPG`: 32.7 MP, 7008 x 4672, 26 MB, in the shared album "Colombia" (88 items, Mar 26 to Apr 10).
-- Google Photos Info panel for it: `Backed up (26 MB)`, `Original quality`, `Not eligible for Storage saver`.
-- Goal: same pictures, same albums, smaller stored size, originals in trash, done safely, automated, runnable from a CLI built with Typer.
-- Unknown: how many such photos exist, how much quota there is to recover, whether the originals also live on a local disk. None of these were asked or measured yet.
+- Owner: Cosmin. Camera: Sony A7 IV. Example file `CMN08911.JPG`: 32.7 MP, 7008 x 4672, 26.0 MB, in the shared album "Colombia" (88 items). Info panel: `Backed up (26 MB)`, `Original quality`, `Not eligible for Storage saver`.
+- Goal: same pictures, same albums, 1 to 2 MB each, good enough for Instagram, Facebook and a printed photobook, originals in trash, done safely from a Typer CLI.
+- First use is interactive (`try`) on a couple of the owner's own photos in one chosen album (possibly shared with others), then widen. Only big photos that still count against quota are touched.
+- The file is `RAW + JPEG` exported by Imaging Edge Desktop (Apr 25), so ARW masters probably exist on a local disk. Not confirmed. If they do, the JPEGs are the disposable part and the risk is low.
+- The camera clock was at UTC-02:00 (`OffsetTimeOriginal -02:00`) while shooting in Colombia (UTC-5). Google shows GMT-02:00 because it trusts the file. Re-uploading keeps this identical, which is correct.
+- Unknown: how many such photos exist and how much quota a full run recovers.
 
-## 2. Findings that shaped the design
+## 2. How the sources were weighed
 
-1. **Why the file is not optimizable.** Storage saver cannot compress JPEGs in Multi-Picture Format (MPF, `.mpo`). Google's own example is Android portrait mode, and reporting notes Ultra HDR falls in the same bucket. The Sony file carries an MPF index plus an embedded second image, so it is skipped and stored at full size. Recompressing the primary image would invalidate the offsets to the second image, which is my explanation for why Google skips them, not something Google states. "Convert existing photos to Storage saver" therefore does nothing for these files.
-2. **No replace in any API.** Since 31 March 2025 the official Library API only lists, searches and reads items the app itself created. Selecting existing items goes through the Picker API. Upload (`photoslibrary.appendonly`) still works. There is no delete and no content replace. Re-uploading the same name creates a second item, dedup is by content hash, not by name.
-3. **How people actually do it.** Everyone runs the same loop: download, compress, delete originals, upload again (ShortPixel's guide is the manual version). Tooling that automates it leaves the official API: a Chrome extension or userscript driving the web UI, or reverse engineered clients (`gpmc` mobile API, `gpwc` web API, Google Photos Toolkit). The Photos deduper author states the API cannot delete items and can only modify items the app uploaded, which is why he built a Chrome extension.
-4. **Google's own conversion is one way.** A blog on this topic warns that retroactive conversion to Storage saver is permanent and Google keeps no originals. Reason enough to keep local copies and never rely on it.
-5. **Upload quality.** The official API uploads at Original quality. `gpmc` has `saver` and `use_quota` switches. Without `use_quota` it behaves like a device with unlimited storage, which is the part most likely to attract attention, so this tool always sets `use_quota=True`.
+Three external reports were ingested and then tested against a real photo. The rule: a claim counts only if it is sourced or measured here. Any source that cites this repo or this file is circular and discounted.
 
-## 3. Architecture and why
+| Source | Verdict |
+|---|---|
+| Perplexity brief (about 120 citations) | Main source. Careful, correct on API limits, MPF behaviour and trash. Its "12 MP is the size to hit 2 MB" hypothesis (H1) is confirmed by measurement. |
+| Pasted Gemini style report | Overclaims. Its unsourced SSIMULACRA2 / MB table is refuted: "12 MP Q85 = 1.4 to 1.9 MB" is really 2.3 MB on the sample. "Pillow drops orientation and ICC" does not apply (both are passed through). "exiftool copy-back fixes the dimensions" is false (it carries the old values). "Attribution resets on re-upload" is irrelevant for your own photos. |
+| `deep-research-report.md` | Circular: cites gphotos-shrink and the old section 7 of this file as "Google's advice". Independently useful for one fact: the web "Recover storage" tool skips MPF files too. Unverified lead: a Japanese "MPF Remover" app. Note `exiftool -MPF=` alone may leave the trailer behind; a full strip also needs `-Trailer:All=`. |
 
-| Decision | Reason | Rejected alternative |
+## 3. Ratified findings
+
+1. **MPF blocks Storage saver.** Storage saver cannot recompress JPEGs in Multi-Picture Format (APP2 `MPF\0` plus a trailing preview image). "Convert existing photos" and "Recover storage" skip them. Why Google skips them is our explanation, not Google's statement. Stripping MPF is reported to make a file eligible (assumption A13, to be measured).
+2. **No replace or delete in any API.** Since 2025-03-31 the official Library API only reads items the app created, the Picker API selects existing ones, and `appendonly` upload still works. Re-uploading creates a second item. Dedup is by content hash. `batchAddMediaItems` works on app-created albums only.
+3. **State is eventually consistent.** Library cache, album membership and trash all lag. The tool polls for about a minute (`_wait_for`) instead of failing on the first read.
+4. **Google-side edits live in Google's database, not in the file.** Date and location edits, descriptions, favorite, archive and album membership do not travel with a re-upload. The tool re-applies favorite, archive and caption and re-adds albums. Date and location edits would be lost, which is why edited items are excluded.
+5. **Shared albums.** Adding an item probably notifies members and the custom position is not kept. Batch commands skip photos in shared albums unless `--include-shared`. `try` asks first.
+6. **Trash retention.** Google's own docs say both 30 and 60 days. The tool says "at least 30 days" and treats 30 as the limit.
+7. **Terms.** gpmc and gpwc use private endpoints with your own credentials. No enforcement is documented, but it is against the spirit of the terms. The tool always uploads with `use_quota=True`.
+8. **Only photos charged to quota matter.** Items already stored free (`quota_charged_bytes = 0`) gain nothing and are excluded by the candidate query.
+
+## 4. Measurements on the real photo
+
+Photo: `samples/CMN08911.JPG` (gitignored). Sony ILCE-7M4, FE 70-200 F4 G OSS, 70 mm, f/8, 1/160, ISO 320, Portrait style with Sharpness +3, sRGB, no ICC, no GPS. Structure: APP1 Exif 49 KB (MakerNote 38 KB), APP1 XMP 57 KB (rating and document ids), APP2 MPF 88 B, primary image 25.07 MB, then a 944 KB trailer (an 891 KB 1616x1080 preview plus Sony hidden data). Original is 4:2:2 baseline.
+
+**Encoder benchmark** (`scripts/bench.py`; SSIMULACRA2 against a lossless downscale at the same resolution; 90 is invisible at 1:1, 80 to 85 is high quality; MB excludes metadata; worst case: foliage):
+
+| MP | Pillow Q90 | Q85 | Q80 | Q75 |
+|---|---|---|---|---|
+| 16 | 3.62 / 86.8 | 2.91 / 84.3 | 2.50 / 82.1 | 2.20 / 79.7 |
+| 12 | 2.87 / 86.4 | 2.32 / 83.8 | 2.00 / 81.7 | 1.77 / 79.2 |
+| 8 | 2.08 / 85.9 | 1.70 / 83.1 | 1.47 / 80.7 | 1.30 / 78.2 |
+
+mozjpeg and jpegli (built from source) land within about 1 point of Pillow at matched file size (12 MP Q85: Pillow 2.32 MB / 83.8, mozjpeg 2.23 / 84.2, jpegli 2.10 / 82.9). 4:4:4 gains nothing at matched size. **Verdict: stay on Pillow, 4:2:0, no new dependency.** The "jpegli saves 35 percent" claim does not show up on this photo.
+
+**The chosen default: 8 MP, Q85.** 3464 x 2309, 1.80 MB with all metadata, SSIMULACRA2 83.1, against 79.2 for 12 MP Q75 (1.87 MB), the best a 2 MB budget allows at 12 MP. Opened side by side at 100 percent, the original, 12 MP Q75 and 8 MP Q85 could not be told apart, and the owner picked 8 MP Q85.
+
+| Use | Needs | 8 MP gives |
 |---|---|---|
-| gpmc (mobile API) for list, download, upload, trash, restore | one client covers all of it, local SQLite cache of the library gives sizes and flags without extra calls | official Library API: cannot read or delete existing items |
-| gpwc (web API) for albums | gpmc has no album listing. gpwc has album pages and add calls | gpmc only: loses "same albums" |
-| Local compression with Pillow, MPF dropped as a side effect | no exiftool dependency, one lossy pass is under our control | strip MPF only and let Storage saver compress (see backlog 4) |
-| Copy first, trash original last, behind checks | an original is never touched until a verified copy exists | in place edits: impossible |
-| JSON state, one stage at a time | resumable, readable, no extra dependency | SQLite (see ceiling note in code) |
-| Dry run default, `--apply` to mutate, `try` for interactive approval | the account is the user's, mistakes are expensive | auto-run |
-| Skip edited, motion, Ultra HDR, locked, shared-with-you, non-JPEG | each would lose something silently | process everything |
+| Instagram, Facebook | about 1080 to 2048 px wide | 3464 px |
+| A4 photobook page at 300 DPI | 8.7 MP | 29.3 x 19.6 cm, about 290 DPI on the full page |
+| 30 x 30 cm page | 12.6 MP on a square crop, 18.8 MP filling it from a 3:2 frame | about 195 DPI; 12 MP gives about 240 DPI |
+| A4 spread at 300 DPI | 17.4 MP | not enough, use `--max-mp 18 --target-mb 4` |
 
-Per photo stages: `candidate, downloaded, compressed, uploaded, albums_done, verified, trashed`, side states `skipped`, `rolled_back`.
+If a photo still exceeds the budget, quality steps down 82, 80, 78, 75. If Q75 is over the budget plus the guard's 10 percent slack (2.2 MB), the outlier guard stops the run; there is no resolution ladder.
 
-## 4. Verified offline vs assumed
+**Metadata technique.** Pillow's `Image.Exif` re-serialization moved the Sony MakerNote (offset 1156 to 936) and the old encode dropped the 57 KB XMP. The fix writes the original EXIF blob verbatim, patches only the four pixel-dimension values in place (`patch_exif_dims`), and passes XMP and ICC through. An exiftool diff of the result against the original shows only the intended changes: dimensions, subsampling and progressive flag, a JFIF header added, MPF gone, and the Sony preview and hidden-data offsets pointing at the removed trailer (harmless exiftool "minor" warnings). Every MakerNote tag, XMP rating, DateTimeOriginal, OffsetTime, SubSec and lens tag is identical.
 
-Verified by `test_offline.py` (real Pillow on generated MPO files, fake Google clients):
+**Strip mode.** Lossless: drops the MPF segment and the trailer, 26.01 MB to 25.07 MB (only 0.94 MB, 3.6 percent). All of its value depends on whether Google then recompresses the file (A13).
 
-- MPF trailer is removed, EXIF date and GPS and make survive, EXIF pixel dimensions follow a resize, mtime is set to capture time.
-- Whole state machine, album add through both the own-album and shared-album payloads (constructor and data shape only), favorite and caption carry over, trash, undo ordering, copies never re-selected, small gain skipped, corrupt download rejected, album failure blocks trash, trash refuses without passing checks, Ultra HDR skipped, `try` end to end with scripted answers, every command's `--help`.
+## 5. Assumptions, verified offline vs live
 
-Not verified, each is a way the tool may fail on a real account. Test in this order with `try`:
+Verified by `pytest` (the `try` command is tested only on its shared-album warning path, not an end-to-end upload) (real Pillow on generated and real files, fake Google clients): the whole state machine, strip and compress output, byte-exact MakerNote and XMP, the outlier guard on injected faults, album spec parsing, halt-on-first-failure, shared-album skipping and warning, quota filter, polling, trash refused without the local original, undo ordering.
 
-| # | Assumption in code | If wrong, you will see | Where |
+Not verified, each is a way the tool may fail on a real account:
+
+| # | Assumption in code | If wrong, you will see | Status |
 |---|---|---|---|
-| A1 | `get_download_urls(media_key)["1"]["5"]["2"]["6"]` is a fetchable original URL, no auth header needed (bearer retry exists for 401/403) | `download response has no usable URL` or HTTP error | `_original_url`, `_download` |
-| A2 | Downloaded size equals library `size_bytes`, and `dedup_key` equals urlsafe base64 of the file's SHA-1 for camera uploads | `refusing to continue` or hash mismatch error. `--no-hash-check` bypasses the hash only | `_download`, `_check_hash` |
-| A3 | `Client.upload({path: {"hash": bytes, "filename": name}}, use_quota=True)` keeps the file name and returns `{resolved_path: media_key}` | `upload returned no media key`, or wrong name in Photos | `_to_uploaded` |
-| A4 | Upload without `--saver` is stored as Original quality and counts the new smaller size. `--saver` is honored for a file without MPF | Info panel shows another size or quality than expected | uploaded copy |
-| A5 | Web album calls `E1Cajb` (own) and `laUYf` (shared) accept a media key from a mobile upload, with fallback to gpmc `add_media_to_album`. Album keys from gpwc are valid for gpmc | verify check `in album X` fails, original stays | `_add_to_album` |
-| A6 | After the trash call, a cache sync shows `trash_timestamp` immediately. If the delta sync lags, `_to_trashed` raises `still in the library` even though trash worked | error on a photo that is actually trashed. Rerun resolves it | `_to_trashed` |
-| A7 | `utc_timestamp` is milliseconds and the copy keeps the original value within 2 s | check `capture time kept` fails | `_to_verified` |
-| A8 | Cache columns `origin='self'`, `is_edited`, `is_micro_video`, `is_locked`, `duration IS NULL` mean what the names say | scan list too long or too short | `Cache._CANDIDATES` |
-| A9 | `set_favorite`, `set_archived`, `set_item_caption` take the dedup key | warning `could not carry over ...` | `_carry_metadata` |
-| A10 | Pillow re-encode of a real Sony A7 IV file keeps MakerNote and EXIF acceptably, and the quality 88 at 16 MP result looks fine | visual diff, missing EXIF in Photos Info | `compress_jpeg` |
-| A11 | Adding to a shared album behaves (notifications to members, ordering) | surprise in the album activity | manual |
+| A1 | `get_download_urls(media_key)["1"]["5"]["2"]["6"]` is a fetchable original URL (bearer retry exists for 401/403) | `download response has no usable URL` or HTTP error | open |
+| A2 | Downloaded size equals library `size_bytes`, and `dedup_key` is urlsafe base64 of the file SHA-1 | `refusing to continue` or hash mismatch | open |
+| A3 | `Client.upload({path: {"hash", "filename"}}, use_quota=True)` keeps the file name and returns `{resolved_path: media_key}` | `upload returned no media key`, wrong name | open |
+| A4 | Upload without `--saver` is stored as Original quality at the smaller size | Info panel shows another size or quality | open |
+| A5 | Web album calls `E1Cajb` (own) and `laUYf` (shared) accept a media key from a mobile upload, with gpmc `add_media_to_album` as fallback | check `in album X` fails, original stays | open |
+| A6 | After trash, a cache sync shows `trash_timestamp` within about a minute | `still in the library` error; rerun resolves | mitigated by polling |
+| A7 | `utc_timestamp` is milliseconds and the copy keeps it within 2 s | check `capture time kept` fails | open |
+| A8 | Cache columns `origin`, `is_edited`, `is_micro_video`, `is_locked`, `duration`, `quota_charged_bytes` mean what the names say | scan list too long or short | open |
+| A9 | `set_favorite`, `set_archived`, `set_item_caption` take the dedup key | warning `could not carry over ...` | open |
+| A10 | Re-encode keeps MakerNote, XMP and EXIF | missing fields in Photos Info | **resolved offline** by verbatim EXIF and XMP, guard checks it per photo |
+| A11 | Adding to a shared album behaves (notifications, ordering) | surprise in album activity | open, `try` asks first |
+| A12 | Google-side edits (date, location, description) revert on re-upload | lost edit on the copy | believed true, edited items excluded |
+| A13 | Storage saver recompresses a stripped file uploaded with `saver=True` | `copy is smaller` fails in `--mode strip` | open, measure with one photo |
+| A14 | A `photos.google.com/share/<key>` or `/album/<key>` URL carries the album media key gpwc lists | `no album matches` | open |
 
-Record results of the run in a `LIVE_RESULTS.md` next to this file, one line per assumption: held, failed, or changed.
+## 6. Live pilot protocol
 
-## 5. Library internals used
+1. Cold backup first: the ARW masters, or a Takeout of the pilot album.
+2. `gphotos-shrink local samples/*.jpg -o out/` on a handful of your own photos, open the results, confirm the checks say `all ok`. No account is touched.
+3. `gphotos-shrink auth-check`, then `scan --album <name or link>` to see exactly what would be touched.
+4. `gphotos-shrink try --album <link> -c 2`. Answer `k` (keep both) after upload. The session stops at the first failed check.
+5. Wait 24 hours, then check in the web UI: copy inside the album, date and time zone, favorite, the shared album activity, and the quota. Record each assumption as held, failed or changed in `LIVE_RESULTS.md`.
+6. Trash the two originals with `trash --id ... --apply`, restore one with `undo` on purpose.
+7. Try `--mode strip` on one photo to settle A13.
+8. Batches of 25, then 250 (`process --apply --limit N`, then `trash`). A batch halts at the first outlier; `--keep-going` overrides.
+
+## 7. Library internals used
 
 gpmc 0.9.0 (`xob0t/gphotos_mobile_client`):
 - `Client(auth_data=..., log_level=...)`, `.update_cache(show_progress)`, `.db_path` (SQLite, table `remote_media`), `.upload(target=..., use_quota, saver, show_progress)`.
@@ -69,34 +127,35 @@ gpwc 0.1 (`xob0t/google_photos_web_client`):
 - Used: `GetAlbumsPage` (`Z5xsfc`), `GetAlbumPage` (`snAcKc`), `AddItemsToExistingAlbum` (`E1Cajb`), `AddItemsToExistingSharedAlbum` (`laUYf`).
 - Present but unused, relevant for backlog 3: `MoveToTrash` and `RestoreFromTrash` (`XwAOJf`), `GetItemInfo` (download URL and `space_taken`), library page listing (`lcxiM`, `EzkLib`), `GetStorageQuota` (`EzwWhf`), `GetTrashPage` (`zy0IHe`).
 
-## 6. Backlog, ranked by impact
+## 8. Backlog, ranked by impact
 
-1. **Run `try` live on 2 photos from 2 albums and fill `LIVE_RESULTS.md`.** Everything else depends on it. Blocking.
-2. **Quantify the win before polishing.** Add a `scan` summary of expected savings using a sample compress, and a `GetStorageQuota` readout. Today the tool cannot say how much space a full run recovers.
-3. **Drop the Android requirement.** The ReVanced plus adb capture is the biggest setup cost. Hypothesis: gpwc already covers listing, original download URL, trash and albums with cookies only. Only upload is missing, and the official Library API `appendonly` scope still supports it with a normal OAuth client. Open question: how to map the Library API `mediaItem.id` to the web `media_key` (match by hash or by file name plus timestamp through gpwc). If that works, `auth_data` disappears. Highest UX gain.
-4. **Try the simplest path and compare.** Strip MPF losslessly (cut the APP2 MPF segment and trailing second image, pure Python, no recompression) and upload with Storage saver, so Google does the only lossy pass. Compare resulting sizes and quality against the current local compress plus original upload. If Google's output is good enough this deletes the compression code. Add as `--mode strip-only`.
-5. **Automatic quality guard.** Compute SSIM or PSNR between original and copy and refuse below a threshold. Compare EXIF before and after (Make, Model, DateTimeOriginal, GPS) and fail the photo if any field is lost. Both are cheap and run before upload.
-6. **Concurrency.** `gpmc.upload` takes `threads`. Download and compress are embarrassingly parallel. Needed once a run exceeds an hour.
-7. **Ultra HDR and HEIC.** Currently skipped. Options: preserve the gain map by compressing it separately and re-embedding, or add `pillow-heif` for HEIC.
-8. **Album order and shared album etiquette.** Preserve position if the web API exposes it. Option to skip photos in shared albums by default.
-9. **Report.** HTML contact sheet with before and after thumbnails, sizes and check results per photo.
-10. **Packaging and CI.** `pip install -e .` works via `pyproject.toml`. Add a CI job for ruff and pytest.
+1. **The live pilot above, and `LIVE_RESULTS.md`.** Blocking.
+2. **Settle strip versus compress** from the pilot data. If Google's own recompression of a stripped file is good, compression code can shrink to the strip path.
+3. **Drop the Android requirement.** Hypothesis: gpwc covers listing, original download URL, trash and albums with cookies only, and the official `appendonly` upload covers the rest with a normal OAuth client. Open question: mapping the Library API `mediaItem.id` to the web `media_key`.
+4. **Quota readout.** gpwc has `GetStorageQuota` (`EzwWhf`). Today the tool cannot say how much a full run recovers.
+5. **Concurrency.** `gpmc.upload` takes `threads`. Only after rate limits are known.
+6. **Ultra HDR and HEIC.** Skipped today.
+7. **HTML contact sheet** with before and after thumbnails and check results.
 
-## 7. Questions for the user
+Hardened after an independent adversarial review (three blind read-only reviewers): unreadable albums now stop the run, trash re-checks the copy and its albums at the moment of trashing, the uploaded file must match the checked SHA-1, a halt blocks the trash phase, `undo` restores after a lagging trash confirmation, changed settings re-make an un-uploaded copy, signed URLs are scrubbed from stored errors. Known and left: `state.json` has no lock (one instance at a time), Q75 over budget halts instead of lowering resolution, `has_mpf` and `has_gain_map` match raw bytes.
 
-1. Is Google Photos your archive, or a viewing layer over originals stored elsewhere? If the originals are on disk, the simplest workflow is: strip MPF locally, set backup to Storage saver, upload through the web uploader, delete the old ones in the UI. This tool is for the case where Google Photos holds the only copy, or for repeated use after every trip.
+Done in this round: quality guard and EXIF comparison, strip mode, safe album selection, shared-album policy, hard-stop on first failure, 8 MP default. Dropped: jpegli and mozjpeg (measured, not worth a dependency).
+
+## 9. Questions for the user
+
+1. Do the ARW masters exist on disk? If yes, the safest cheap path for the pilot is a backup of those.
 2. Are you willing to capture the gpmc auth data from an Android device, or would you prefer the OAuth plus cookies route from backlog 3?
-3. Acceptable risk: this uses private Google endpoints with your own credentials.
-4. How many photos at or above 5 MB are in the library, and how much quota do you want back?
+3. How many photos at or above 5 MB are in the library, and how much quota do you want back?
 
-## 8. Risks
+## 10. Risks
 
 - Terms of service: private endpoints, account action possible though unlikely for personal use.
-- Endpoint drift: both clients are reverse engineered and can break any day. Pin versions after the first successful live run.
-- Credential exposure: auth data and cookies grant account access. Files are read from `~/.gphotos-shrink`, a permission warning is printed for loose modes, nothing is sent anywhere except Google. Keep it that way.
+- Endpoint drift: both clients are reverse engineered and can break any day. gpwc is pinned to a commit, gpmc to its minor version.
+- Credential exposure: auth data and cookies grant account access. Files are read from `~/.gphotos-shrink`, a permission warning is printed for loose modes, nothing is sent anywhere except Google.
 - Quota does not drop until the Google Photos trash is emptied, which the tool deliberately never does.
+- Visual loss is bounded by the guard (pixel drift on a 256 px sample) but not eliminated; it is lossy compression. The local original stays on disk until you delete it.
 
-## 9. For the next agent
+## 11. For the next agent
 
 Working conventions from the owner's standing instructions:
 - Python or TypeScript, simplest solution that works first, small diffs, one concern per change.
@@ -107,9 +166,9 @@ Working conventions from the owner's standing instructions:
 
 Starter prompt:
 
-> Read `RESEARCH.md` and `README.md` in `gphotos-shrink/`. Run `pytest test_offline.py` and `ruff check .`. Do not touch the real Google account. Propose a short plan for backlog items 3 and 4 (cookie only route and the strip-only mode), listing what has to be measured live first and what can be built and tested offline with fakes. Wait for approval before coding.
+> Read `RESEARCH.md` and `README.md` in `gphotos-shrink/`. Run `pytest` and `ruff check .`. Do not touch the real Google account. Help me run the pilot protocol in section 6 step by step, and wait for my approval before any command that changes my account.
 
-## 10. Sources
+## 12. Sources
 
 - Not eligible for Storage saver (MPF, portraits, Ultra HDR): https://9to5google.com/2024/05/17/google-photos-not-eligible-storage-saver/
 - Google Photos help, backup quality and storage saver: https://support.google.com/photos/answer/6220791
@@ -122,3 +181,4 @@ Starter prompt:
 - gpwc: https://github.com/xob0t/google_photos_web_client
 - Google Photos Toolkit: https://github.com/xob0t/Google-Photos-Toolkit
 - Read-only MCP built on gpwc (cookies.txt method, notes on the March 2025 change): https://glama.ai/mcp/servers/vsmelov/google-photos-mcp
+- Encoders and metric used in the benchmark: https://github.com/google/jpegli, https://github.com/mozilla/mozjpeg, https://github.com/cloudinary/ssimulacra2
