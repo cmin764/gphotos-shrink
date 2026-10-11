@@ -2,6 +2,25 @@
 
 For the next agent (or for you in a month). Read this, then `README.md`, run `pytest`, then follow the pilot protocol in section 6. The most valuable next step is not code, it is one live `try` on two photos of one album, because every assumption about Google's side is still unverified.
 
+## 0. Settled and open
+
+| Decided | Where |
+|---|---|
+| Default copy: 8 MP, Q85, 2 MB budget, quality-only step-down; Pillow, 4:2:0 progressive, no new encoder | section 4 |
+| Verbatim EXIF (dimensions patched in place), XMP and ICC kept | section 4 |
+| Every copy passes the outlier guard before upload; a batch halts at the first failure and then trashes nothing | README |
+| Trash re-checks the copy, its albums and the local original at that moment; unreadable albums stop the run | section 8 |
+| Shared albums skipped unless `--include-shared`; `try` asks first | section 3 |
+| Only own, unedited, quota-charged JPEGs of at least 5 MB | README |
+| Trash is "at least 30 days"; nothing is ever deleted permanently | section 3 |
+
+| Still open | Resolved by |
+|---|---|
+| Does Google accept the calls (A1 to A5, A7 to A9, A14) | live pilot, section 6 |
+| Does Storage saver recompress a stripped file (A13), and does the dedup key change | pilot step 7 |
+| Do ARW masters exist locally | section 9, question 1 |
+| `try` end-to-end upload path is untested offline | next test round |
+
 ## 1. The case
 
 - Owner: Cosmin. Camera: Sony A7 IV. Example file `CMN08911.JPG`: 32.7 MP, 7008 x 4672, 26.0 MB, in the shared album "Colombia" (88 items). Info panel: `Backed up (26 MB)`, `Original quality`, `Not eligible for Storage saver`.
