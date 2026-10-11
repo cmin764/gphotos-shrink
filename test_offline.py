@@ -5,6 +5,7 @@ They prove the tool's logic and its safety rules, not that Google accepts the ca
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,7 +15,8 @@ from typing import Any
 
 import pytest
 import requests
-from PIL import Image
+import typer
+from PIL import Image, ImageOps
 from typer.testing import CliRunner
 
 import gphotos_shrink as gs
@@ -76,7 +78,8 @@ def test_compress_strips_mpf_keeps_exif_and_resizes(tmp_path: Path) -> None:
     make_jpeg(src, (2000, 1500), mpo=True)
     with Image.open(src) as probe:
         assert getattr(probe, "n_frames", 1) == 2
-    width, height = gs.compress_jpeg(src, dst, quality=85, max_mp=1.0, mtime_ms=1_500_000_000_000)
+    width, height, quality = gs.compress_jpeg(src, dst, quality=85, max_mp=1.0, mtime_ms=1_500_000_000_000)
+    assert quality == 85
     assert width * height <= 1_000_000
     with Image.open(dst) as out:
         assert out.format == "JPEG"
@@ -90,7 +93,167 @@ def test_compress_strips_mpf_keeps_exif_and_resizes(tmp_path: Path) -> None:
 def test_compress_keeps_resolution_below_cap(tmp_path: Path) -> None:
     src, dst = tmp_path / "in.jpg", tmp_path / "out.jpg"
     make_jpeg(src, (800, 600))
-    assert gs.compress_jpeg(src, dst, quality=85, max_mp=16.0) == (800, 600)
+    assert gs.compress_jpeg(src, dst, quality=85, max_mp=16.0) == (800, 600, 85)
+
+
+def noisy_jpeg(path: Path) -> None:
+    Image.frombytes("RGB", (1200, 900), os.urandom(1200 * 900 * 3)).save(path, "JPEG", quality=100)
+
+
+def test_quality_steps_down_until_the_budget_fits(tmp_path: Path) -> None:
+    src = tmp_path / "noise.jpg"
+    noisy_jpeg(src)
+    assert gs.compress_jpeg(src, tmp_path / "a.jpg", quality=85, max_mp=16.0, target_mb=100)[2] == 85
+    assert gs.compress_jpeg(src, tmp_path / "b.jpg", quality=85, max_mp=16.0, target_mb=0.0001)[2] == 75
+    mid = (tmp_path / "a.jpg").stat().st_size * 0.8 / 1e6
+    used = gs.compress_jpeg(src, tmp_path / "c.jpg", quality=85, max_mp=16.0, target_mb=mid)[2]
+    assert used < 85
+    assert (tmp_path / "c.jpg").stat().st_size <= mid * 1e6 or used == 75
+
+
+def test_strip_mpf_removes_trailer_and_keeps_pixels(tmp_path: Path) -> None:
+    src = tmp_path / "in.jpg"
+    make_jpeg(src, (800, 600), mpo=True)
+    data = src.read_bytes()
+    assert b"MPF\x00" in data
+    stripped = gs.strip_mpf(data)
+    assert b"MPF\x00" not in stripped
+    assert len(stripped) < len(data)
+    out = tmp_path / "out.jpg"
+    out.write_bytes(stripped)
+    with Image.open(src) as before, Image.open(out) as after:
+        assert after.format == "JPEG"
+        assert before.tobytes() == after.tobytes()
+        assert before.getexif()[0x010F] == after.getexif()[0x010F]
+    with pytest.raises(ValueError):
+        gs.strip_mpf(b"not a jpeg")
+    with pytest.raises(ValueError):
+        gs.strip_mpf(data[:60])
+
+
+def test_patch_exif_dims_moves_nothing_else() -> None:
+    exif = Image.Exif()
+    exif[0x0100], exif[0x0101] = 7008, 4672
+    sub = exif.get_ifd(0x8769)
+    sub[0xA002], sub[0xA003] = 7008, 4672
+    maker = b"MAKERNOTE" * 20
+    sub[0x927C] = maker
+    blob = exif.tobytes()
+    patched = gs.patch_exif_dims(blob, 3464, 2309)
+    assert len(patched) == len(blob)
+    assert patched.index(maker) == blob.index(maker)  # offsets intact
+    reread = Image.Exif()
+    reread.load(patched)
+    assert (reread[0x0100], reread[0x0101]) == (3464, 2309)
+    assert (reread.get_ifd(0x8769)[0xA002], reread.get_ifd(0x8769)[0xA003]) == (3464, 2309)
+    assert gs.patch_exif_dims(b"garbage", 1, 1) == b"garbage"
+
+
+def test_compress_keeps_xmp_and_makernote_bytes(tmp_path: Path) -> None:
+    src, dst = tmp_path / "in.jpg", tmp_path / "out.jpg"
+    exif = Image.Exif()
+    exif[0x010F] = "TestCam"
+    exif.get_ifd(0x8769)[0x927C] = b"MAKERNOTE" * 20
+    Image.linear_gradient("L").resize((1000, 800)).convert("RGB").save(src, "JPEG", exif=exif, xmp=b"<x:xmpmeta>rating</x:xmpmeta>", quality=95)
+    gs.compress_jpeg(src, dst, quality=85, max_mp=0.5)
+    with Image.open(src) as a, Image.open(dst) as b:
+        assert b.info["xmp"] == a.info["xmp"]
+        assert b.getexif().get_ifd(0x8769)[0x927C] == a.getexif().get_ifd(0x8769)[0x927C]
+
+
+# --------------------------------------------------------------------------- outlier guard
+
+
+def failed_checks(checks: list[list[Any]]) -> set[str]:
+    return {c[0].removeprefix(gs.LOCAL_PREFIX) for c in checks if not c[1]}
+
+
+@pytest.fixture
+def pair(tmp_path: Path) -> tuple[Path, Path, gs.Config]:
+    src, dst = tmp_path / "in.jpg", tmp_path / "out.jpg"
+    make_jpeg(src, (2400, 1800))
+    cfg = gs.Config(tmp_path)
+    gs.compress_jpeg(src, dst, quality=85, max_mp=cfg.max_mp)
+    return src, dst, cfg
+
+
+def test_guard_passes_a_good_copy(pair: tuple[Path, Path, gs.Config]) -> None:
+    assert failed_checks(gs.check_copy(*pair)) == set()
+
+
+def test_guard_trips_on_wrong_pixels(pair: tuple[Path, Path, gs.Config]) -> None:
+    src, dst, cfg = pair
+    with Image.open(src) as im:
+        ImageOps.invert(im.convert("RGB")).save(dst, "JPEG", quality=85, exif=im.getexif())
+    assert failed_checks(gs.check_copy(src, dst, cfg)) == {"pixels match original"}
+
+
+def test_guard_trips_on_lost_metadata(pair: tuple[Path, Path, gs.Config]) -> None:
+    src, dst, cfg = pair
+    with Image.open(src) as im:
+        im.save(dst, "JPEG", quality=85)
+    assert failed_checks(gs.check_copy(src, dst, cfg)) == {"camera metadata identical"}
+
+
+def test_guard_trips_on_wrong_shape(pair: tuple[Path, Path, gs.Config]) -> None:
+    src, dst, cfg = pair
+    with Image.open(src) as im:
+        im.resize((1200, 1200)).save(dst, "JPEG", quality=85, exif=im.getexif())
+    assert "aspect ratio kept" in failed_checks(gs.check_copy(src, dst, cfg))
+
+
+def test_guard_trips_on_oversize(pair: tuple[Path, Path, gs.Config]) -> None:
+    src, dst, cfg = pair
+    cfg.target_mb = 0.001
+    assert failed_checks(gs.check_copy(src, dst, cfg)) == {"within size budget"}
+    assert "smaller than original" in failed_checks(gs.check_copy(dst, src, cfg))
+
+
+def test_strip_mode_copy_passes_the_guard(tmp_path: Path) -> None:
+    src, dst = tmp_path / "in.jpg", tmp_path / "out.jpg"
+    make_jpeg(src, (800, 600), mpo=True)
+    cfg = gs.Config(tmp_path, mode=gs.Mode.STRIP)
+    gs.make_copy(src, dst, cfg)
+    assert failed_checks(gs.check_copy(src, dst, cfg)) == set()
+    plain = tmp_path / "plain.jpg"
+    make_jpeg(plain, (800, 600))
+    with pytest.raises(gs.SkipItem):
+        gs.make_copy(plain, tmp_path / "x.jpg", cfg)
+
+
+# --------------------------------------------------------------------------- album specs
+
+
+ALBUMS = [gs.AlbumRef("k1", "Colombia", False), gs.AlbumRef("k2", "Peru", True), gs.AlbumRef("k3", "peru", False)]
+
+
+def test_resolve_album_forms(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert gs.resolve_album(ALBUMS, "colombia").key == "k1"
+    assert gs.resolve_album(ALBUMS, "k1").key == "k1"
+    assert gs.resolve_album(ALBUMS, "https://photos.google.com/u/1/album/k1").key == "k1"
+    assert gs.resolve_album(ALBUMS, "https://photos.google.com/share/k1?key=abc").key == "k1"
+    monkeypatch.setattr(requests, "head", lambda *_, **__: SimpleNamespace(url="https://photos.google.com/share/k1?key=z"))
+    assert gs.resolve_album(ALBUMS, "https://photos.app.goo.gl/AbCd").key == "k1"
+
+
+def test_resolve_album_errors() -> None:
+    with pytest.raises(ValueError, match="2 albums are titled"):
+        gs.resolve_album(ALBUMS, "Peru")
+    with pytest.raises(ValueError, match="Did you mean: Colombia"):
+        gs.resolve_album(ALBUMS, "Colombi")
+    with pytest.raises(ValueError, match="no album key"):
+        gs.resolve_album(ALBUMS, "https://photos.google.com/photo/xyz")
+
+
+def test_wait_for() -> None:
+    calls: list[int] = []
+
+    def second_time() -> bool:
+        calls.append(1)
+        return len(calls) == 2
+
+    assert gs._wait_for(second_time, attempts=3, delay=0)
+    assert not gs._wait_for(lambda: False, attempts=2, delay=0)
 
 
 # --------------------------------------------------------------------------- state
@@ -220,6 +383,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     lib.add(ORIGINAL_KEY, gs.dedup_key_of(gs.sha1_file(original)), "IMG_1.JPG", len(body), 1_700_000_000_000)
 
     albums = {ALBUM.key: {ORIGINAL_KEY}}
+    monkeypatch.setattr(gs, "WAIT_DELAY", 0)
     monkeypatch.setattr(requests, "get", lambda *_, **__: FakeResponse(body))
     monkeypatch.setattr(gs, "list_albums", lambda _web: [ALBUM])
     monkeypatch.setattr(gs, "album_media_keys", lambda _web, key: set(albums[key]))
@@ -306,6 +470,43 @@ def test_undo_restores_original_then_drops_copy(world: SimpleNamespace) -> None:
     assert item.stage == "rolled_back"
 
 
+def test_quota_free_items_are_not_candidates(world: SimpleNamespace) -> None:
+    with world.lib._conn() as conn:
+        conn.execute("UPDATE remote_media SET quota_charged_bytes = 0")
+    assert world.shrinker.select(gs.Selection(min_mb=0)) == []
+
+
+def test_album_selection_by_key_and_link(world: SimpleNamespace) -> None:
+    for spec in ("Colombia", "album_key", "https://photos.google.com/album/album_key"):
+        assert len(world.shrinker.select(gs.Selection(min_mb=0, albums=[spec]))) == 1
+    with pytest.raises(typer.Exit):
+        world.shrinker.select(gs.Selection(min_mb=0, albums=["Nowhere"]))
+
+
+def test_shared_albums_are_skipped_unless_included(world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gs, "list_albums", lambda _web: [gs.AlbumRef("album_key", "Colombia", shared=True)])
+    assert world.shrinker.select(gs.Selection(min_mb=0)) == []
+    assert world.shrinker.skipped_shared == 1
+    assert len(world.shrinker.select(gs.Selection(min_mb=0, include_shared=True))) == 1
+
+
+def test_outlier_blocks_upload(world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gs, "check_copy", lambda *_: [[gs.LOCAL_PREFIX + "pixels match original", False, "mean drift 40"]])
+    item = pick(world)
+    assert not world.shrinker.advance(item, "verified")
+    assert "outlier" in item.error
+    assert world.lib.uploads == []
+
+
+def test_trash_refused_without_local_original(world: SimpleNamespace) -> None:
+    item = pick(world)
+    assert world.shrinker.advance(item, "verified"), item.error
+    Path(item.original_path).unlink()
+    assert not world.shrinker.advance(item, "trashed")
+    assert "local backup" in item.error
+    assert world.lib.api.trashed == []
+
+
 # --------------------------------------------------------------------------- CLI
 
 
@@ -314,7 +515,7 @@ def test_cli_help_and_empty_status(tmp_path: Path) -> None:
     env = {"GPS_WORKDIR": str(tmp_path)}
     help_result = runner.invoke(gs.app, ["--help"], env=env)
     assert help_result.exit_code == 0
-    for command in ("auth-check", "scan", "try", "process", "run", "trash", "undo", "status"):
+    for command in ("auth-check", "scan", "try", "process", "run", "trash", "undo", "status", "local"):
         assert command in help_result.output
     status_result = runner.invoke(gs.app, ["status"], env=env)
     assert status_result.exit_code == 0
@@ -340,7 +541,7 @@ def cli(world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(gs, "GpmcClient", lambda **_: world.lib)
     monkeypatch.setattr(gs, "GpwcClient", lambda *_, **__: object())
     env = {"GPS_WORKDIR": str(world.cfg.workdir), "GP_AUTH_DATA": "androidId=fake"}
-    return lambda *args: CliRunner().invoke(gs.app, list(args), env=env)
+    return lambda *args, **kwargs: CliRunner().invoke(gs.app, list(args), env=env, **kwargs)
 
 
 def test_cli_scan_lists_candidate_and_writes_csv(cli: Any, world: SimpleNamespace, tmp_path: Path) -> None:
@@ -396,3 +597,68 @@ def test_cli_auth_check(cli: Any) -> None:
     result = cli("auth-check")
     assert result.exit_code == 0, result.output
     assert "authenticated" in result.output
+
+
+def test_cli_halts_at_first_outlier_unless_keep_going(cli: Any, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    world.lib.add("second_key", "x" * 27, "IMG_2.JPG", len(world.body), 1_700_000_000_000)
+    monkeypatch.setattr(gs, "check_copy", lambda *_: [[gs.LOCAL_PREFIX + "pixels match original", False, ""]])
+    state_path = world.cfg.workdir / "state.json"
+
+    result = cli("process", "--min-size-mb", "0", "--apply", "--yes")
+    assert "Halted" in result.output
+    assert len(gs.State(state_path).items) == 1
+    assert world.lib.uploads == []
+
+    result = cli("process", "--min-size-mb", "0", "--keep-going")
+    assert "Halted" not in result.output
+
+
+def test_cli_try_warns_before_touching_a_shared_album(cli: Any, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gs, "list_albums", lambda _web: [gs.AlbumRef("album_key", "Colombia", shared=True)])
+    result = cli("try", "--min-size-mb", "0", "--album", "Colombia", "--count", "1", input="n\nn\n")
+    assert "Shared with others" in result.output
+    assert world.lib.uploads == []
+
+
+def test_cli_batch_reports_skipped_shared(cli: Any, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gs, "list_albums", lambda _web: [gs.AlbumRef("album_key", "Colombia", shared=True)])
+    result = cli("process", "--min-size-mb", "0")
+    assert "--include-shared" in result.output
+    assert cli("process", "--min-size-mb", "0", "--include-shared").exit_code == 0
+
+
+def test_cli_local_needs_no_account(tmp_path: Path) -> None:
+    src, out = tmp_path / "in.jpg", tmp_path / "out"
+    make_jpeg(src, (2400, 1800))
+    result = CliRunner().invoke(gs.app, ["local", str(src), "-o", str(out)], env={"GPS_WORKDIR": str(tmp_path / "w"), "GP_AUTH_DATA": ""})
+    assert result.exit_code == 0, result.output
+    assert (out / "in_compress.jpg").exists()
+    assert "all ok" in result.output
+
+
+# --------------------------------------------------------------------------- real photo (local only)
+
+SAMPLE = Path(__file__).parent / "samples" / "CMN08911.JPG"
+needs_sample = pytest.mark.skipif(not SAMPLE.exists(), reason="samples/CMN08911.JPG is gitignored; add a real Sony MPF JPEG to run these")
+
+
+@needs_sample
+def test_real_photo_default_compress(tmp_path: Path) -> None:
+    cfg, dst = gs.Config(tmp_path), tmp_path / "out.jpg"
+    width, height, _ = gs.make_copy(SAMPLE, dst, cfg)
+    assert width * height <= cfg.max_mp * 1.001e6
+    assert dst.stat().st_size <= cfg.target_mb * 1e6
+    assert failed_checks(gs.check_copy(SAMPLE, dst, cfg)) == set()
+    with Image.open(SAMPLE) as a, Image.open(dst) as b:
+        assert b.info["xmp"] == a.info["xmp"]
+        assert b.getexif().get_ifd(0x8769)[0x927C] == a.getexif().get_ifd(0x8769)[0x927C]
+        assert b.getexif().get_ifd(0x8769)[0xA002] == width
+
+
+@needs_sample
+def test_real_photo_strip(tmp_path: Path) -> None:
+    cfg, dst = gs.Config(tmp_path, mode=gs.Mode.STRIP), tmp_path / "out.jpg"
+    gs.make_copy(SAMPLE, dst, cfg)
+    assert not gs.has_mpf(dst)
+    assert SAMPLE.stat().st_size - dst.stat().st_size > 900_000  # the 944 KB trailer
+    assert failed_checks(gs.check_copy(SAMPLE, dst, cfg)) == set()

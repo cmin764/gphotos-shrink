@@ -1,21 +1,37 @@
 # gphotos-shrink
 
-Replace oversized JPEGs in Google Photos with compressed copies that sit in the same albums. The originals go to the Google Photos trash, only after every check passes, and stay restorable for 60 days.
+Replace oversized JPEGs in Google Photos with compressed copies that sit in the same albums. The originals go to the Google Photos trash, only after every check passes, and stay restorable for at least 30 days.
 
-Why this exists: Google Photos has no "replace" call. Re-uploading under the same name creates a second item, never an overwrite. Sony and Android JPEGs carry a Multi-Picture Format (MPF) trailer, which Google's own Storage saver refuses to compress ("Not eligible for Storage saver"), so these files stay at full size and count fully against your quota. This tool re-encodes them locally (which drops the MPF trailer), uploads the result, and swaps it into place.
+Why this exists: Google Photos has no "replace" call. Re-uploading under the same name creates a second item, never an overwrite. Sony and Android JPEGs carry a Multi-Picture Format (MPF) trailer, which Google's own Storage saver refuses to compress ("Not eligible for Storage saver"), so these files stay at full size and count fully against your quota. This tool shrinks them locally (dropping the MPF trailer), uploads the result, and swaps it into place. A 26 MB Sony JPEG becomes about 1.8 MB, with every EXIF, MakerNote and XMP field intact.
 
-Status: the logic is tested offline against fake Google clients (11 tests). It has not been run against a live account. Section "Validate the workflow by hand" is how you find out whether Google behaves the way the tool assumes. Do that before any batch run.
+Status: the logic is tested offline against fake Google clients and a real Sony photo. It has not been run against a live account. Start with `local` (no account needed), then follow "Validate the workflow by hand". Do that before any batch run.
+
+## The compression rule
+
+Default: cap at **8 MP (3464 x 2309), JPEG quality 85**, 4:2:0, progressive, Lanczos downscale, under a **2 MB budget**. Chosen by measurement on a real 33 MP Sony file, not by guess: it scored SSIMULACRA2 83 (high quality) at 1.8 MB and was visually indistinguishable from the original at 100 percent. See `RESEARCH.md` section 4.
+
+| Use | Enough? |
+|---|---|
+| Instagram, Facebook | yes, 3 to 4 times the pixels they keep |
+| A4 photobook page at 300 DPI | yes (29 x 20 cm) |
+| 30 x 30 cm page | about 200 DPI, fine for a book; for 300 DPI use `--max-mp 12` |
+| A4 spread or poster | `--max-mp 16 --target-mb 3.5` |
+
+If a copy exceeds `--target-mb`, quality steps down (82, 80, 78, 75). The original EXIF blob is written byte for byte (Sony MakerNote offsets stay valid), with only the pixel dimensions patched. XMP and the ICC profile are carried over. Nothing is rotated, so Orientation stays valid.
+
+`--mode strip` is the lossless alternative: it only drops the MPF block and its trailing preview (saves about 1 MB on a 26 MB file) and uploads as Storage saver so Google does the recompression. Whether Google really does is the open question A13 in `RESEARCH.md`; try it on one photo.
 
 ## How one photo moves through it
 
 1. download the original, check size and SHA-1 against the library
-2. compress locally (resolution cap, quality, EXIF and color profile kept)
-3. upload the copy with the original file name
-4. add the copy to every album the original was in, carry over favorite, archive and caption
-5. verify: copy exists, is smaller, capture time and file name kept, present in each album
-6. move the original to trash (separate, gated step)
+2. make the copy (compress or strip)
+3. **outlier guard**, before anything is uploaded: smaller than the original, inside the size budget, same aspect ratio and orientation, Make, Model, DateTimeOriginal, OffsetTime, lens, MakerNote, GPS and XMP identical, and a 256 px pixel comparison to catch a wrong frame or colour shift. Any failure stops the run
+4. upload the copy with the original file name
+5. add the copy to every album the original was in, carry over favorite, archive and caption
+6. verify (polls up to a minute, the library is eventually consistent): copy exists, is smaller, capture time and file name kept, present in each album
+7. move the original to trash (separate, gated step, refused unless the downloaded original is still on disk)
 
-Progress is saved after every stage. A failure parks that photo and the run continues. Rerun to resume.
+Progress is saved after every stage. **A batch halts at the first photo that fails a check** and prints where the original and the copy are; `--keep-going` parks it and continues instead. Rerun to resume.
 
 ## Install
 
@@ -90,7 +106,7 @@ Highest priority first:
 Check it:
 
 ```bash
-python gphotos_shrink.py -v auth-check
+gphotos-shrink -v auth-check
 ```
 
 It prints the account each client signed in as (visible with `-v`). Confirm they match. If auth fails later, the cookies or token expired: capture them again.
@@ -101,70 +117,78 @@ Every command that changes anything online is a dry run until you pass `--apply`
 
 | Command | What it does | Changes online? |
 |---|---|---|
+| `local FILE... -o DIR` | run the exact copy pipeline and checks on local files, no credentials needed | no |
 | `auth-check` | verify both credentials | no |
 | `scan` | list candidates at or above `--min-size-mb` (default 5) with albums | no |
-| `try` | interactive test on a few photos, approval before each irreversible step | only as you approve |
-| `process` | download, compress, upload, re-album, verify. Never trashes | with `--apply` |
+| `try` | interactive test on a few photos, approval before each irreversible step, stops at the first failed check | only as you approve |
+| `process` | download, make copy, upload, re-album, verify. Never trashes | with `--apply` |
 | `trash` | trash originals of verified photos | with `--apply` |
 | `run` | `process` then `trash` in one go | with `--apply` |
 | `undo --id KEY` | restore the original from trash, then trash the copy | with `--apply` |
 | `status` | stage, sizes and errors per tracked photo | no |
 
-Useful options on `scan`, `try`, `process`, `run`: `--min-size-mb`, `--album` (repeatable), `--id` (repeatable), `--limit`, `--quality` (88), `--max-mp` (16), `--min-saving` (0.20), `--saver/--original`, `--no-hash-check`. Run any command with `--help`.
+Options on `scan`, `try`, `process`, `run`:
 
-Compression defaults: cap at 16 MP (what Storage saver uses), JPEG quality 88, 4:2:0 subsampling, progressive. `--original` stores the copy exactly as compressed locally. `--saver` additionally lets Google recompress it, which can shrink more but adds a second lossy pass. Measure with `try` before choosing.
+- `--album` (repeatable): the album's title, its key, a `photos.google.com/.../album/<key>` or `/share/<key>` URL, or a `photos.app.goo.gl` short link. A duplicate title is refused and the keys are listed; a typo gets suggestions.
+- `--include-shared`: photos in albums shared with others are skipped by default (adding a copy may notify members and loses custom position). `try` includes them but asks before touching one.
+- `--id`, `--limit`, `--min-size-mb` (5).
+- `--max-mp` (8), `--quality` (85), `--target-mb` (2.0), `--mode compress|strip`, `--min-saving` (0.20), `--saver/--original`, `--no-hash-check`, `--keep-going`.
+
+Only photos that are your own, unedited and charged to your quota are candidates. Run any command with `--help`.
 
 ## Validate the workflow by hand
 
-Do this first, on two photos from two different albums, ideally one in your shared Colombia album and one in a plain album.
+Back up first (the ARW masters, or a Takeout of the pilot album), then:
 
 ```bash
-python gphotos_shrink.py scan                    # see candidates and their albums
-python gphotos_shrink.py try --count 2           # one photo per album where possible
-python gphotos_shrink.py try --album Colombia --album "Some Other Album" --count 2   # or choose the albums
+gphotos-shrink local ~/Pictures/some.jpg -o out/                   # no account: vet size, quality and the checks
+gphotos-shrink scan --album "<name or link>"                       # see exactly what would be touched
+gphotos-shrink try --album "<name or link>" --count 2              # interactive, 2 photos of that album
 ```
 
 For each photo `try` walks you through this:
 
-1. Downloads and compresses. Prints original vs compressed size, dimensions and albums. Writes `original.jpg` and `compressed.jpg` to `~/.gphotos-shrink/review/<name>/` and offers to open both.
-   Look at: sharpness at 100% zoom on a detailed area, skies and gradients for banding, colors side by side. If quality is not good enough, press `n` at the upload prompt, rerun with `--quality 92` or `--max-mp 24`.
-2. Asks `Upload the compressed copy and add it to the same albums?` Default is no.
-3. Uploads, adds to albums, carries over favorite, archive and caption, then re-syncs and prints a Checks table. Anything red means the original is left alone.
+1. Downloads and makes the copy. Prints original vs copy size, dimensions, quality and albums. Writes `original.jpg` and `compressed.jpg` to `~/.gphotos-shrink/review/<name>/` and offers to open both.
+   Look at: sharpness at 100% zoom on a detailed area, skies and gradients for banding, colors side by side. If it is not good enough, press `n` at the upload prompt and rerun with `--max-mp 12` or `--quality 90 --target-mb 3`.
+2. If the album is shared with others, warns first. Then asks `Upload the compressed copy and add it to the same albums?` Default is no.
+3. Uploads, adds to albums, carries over favorite, archive and caption, then re-syncs and prints a Checks table. Anything red stops the session and leaves the original alone.
 4. Now open photos.google.com and look yourself. Search the file name. Confirm:
-   - both versions exist, the copy shows the smaller size under Info and the same date and location
-   - the copy is inside every album the original was in (open each album)
-   - in a shared album, the copy appears for members and nothing odd happened to the original. Adding items to a shared album may notify other members, so test with a photo where that is fine.
-   - the copy's position in the album is acceptable (new items usually land at the end, the tool does not control order)
+   - both versions exist, the copy shows the smaller size under Info and the same date, time zone and location
+   - the copy is inside every album the original was in
+   - in a shared album, the copy appears for members and nothing odd happened to the original
+   - the copy's position in the album is acceptable (new items land at the end)
 5. Choose what happens to the original: `t` trash it, `k` keep both for now (default), `u` undo (trash the copy).
 
-Choose `k` on the first run. After inspecting, either:
+Choose `k` on the first run, wait a day, then:
 
 ```bash
-python gphotos_shrink.py trash --id <media_key> --apply      # media keys are in `status`
-python gphotos_shrink.py undo  --id <media_key> --apply
+gphotos-shrink trash --id <media_key> --apply      # media keys are in `status`
+gphotos-shrink undo  --id <media_key> --apply
 ```
 
-Approve the workflow when, for both test photos: the Checks table is all green, the albums match, the visual comparison is acceptable, and the trashed original restores cleanly with `undo`. Test `undo` at least once on purpose.
+Approve the workflow when, for both test photos: the Checks table is all green, the albums match, the visual comparison is acceptable, and the trashed original restores cleanly with `undo`. Test `undo` at least once on purpose. Then widen in steps: `process --apply --limit 25`, then 250. The full protocol, with what to record, is in `RESEARCH.md` section 6.
 
 If something is off, run with `-v` and save the output. `RESEARCH.md` lists what is assumed but unverified, which is where a surprise most likely comes from.
 
 ## Batch use
 
 ```bash
-python gphotos_shrink.py scan --min-size-mb 5
-python gphotos_shrink.py process --limit 10              # dry run: local download + compress only
-python gphotos_shrink.py process --limit 10 --apply      # upload + verify, nothing trashed
-python gphotos_shrink.py status
-python gphotos_shrink.py trash --apply                   # after you spot-checked in the Photos UI
+gphotos-shrink scan --min-size-mb 5
+gphotos-shrink process --limit 10              # dry run: local download + copy + checks only
+gphotos-shrink process --limit 10 --apply      # upload + verify, nothing trashed
+gphotos-shrink status
+gphotos-shrink trash --apply                   # after you spot-checked in the Photos UI
 ```
 
 `run --apply` does `process` and `trash` together with two confirmation prompts. `--yes` skips the prompts.
 
 ## What counts as safe
 
-- Nothing is deleted permanently. The only destructive call is "move to trash", which Google keeps for 60 days. `undo` reverses it.
+- Nothing is deleted permanently. The only destructive call is "move to trash", which Google keeps for at least 30 days (its docs say both 30 and 60). `undo` reverses it.
 - An original is only trashed if a distinct copy exists and all checks passed. The trash step re-checks this itself.
 - The download must match the library's size and, when the library stores a SHA-1, the hash. Otherwise the photo stops there.
+- Every copy must pass the outlier guard before upload, and a batch stops at the first failure.
+- The trash step also refuses unless the downloaded original is still on disk and unchanged.
 - The tool never re-processes copies it created, and skips photos where compression saves less than `--min-saving`.
 - Originals stay on disk in `~/.gphotos-shrink/downloads/` until you delete them. Keep them until you are happy, they are your second backup.
 - Trashed items still count against quota until the Google Photos trash is emptied. The tool never empties it. Do that yourself after you are sure.
@@ -177,12 +201,15 @@ python gphotos_shrink.py trash --apply                   # after you spot-checke
 | motion photos and videos | re-encoding breaks the embedded video |
 | Ultra HDR JPEGs | re-encoding drops the gain map, turning HDR into SDR |
 | locked folder, shared-with-you, partner items | not yours to change |
+| items already stored free (not charged to quota) | nothing to gain |
+| photos in albums shared with others | only with `--include-shared` (members may be notified) |
 | non-JPEG (HEIC, PNG, RAW) | v1 handles JPEG only |
 
 ## Known limits
 
 - Unofficial APIs. gpmc and gpwc use private Google endpoints with your own credentials. That is against Google's terms in spirit, Google can change them at any time, and an account action is possible though unlikely for personal use. The tool uploads with `use_quota=True` so it does not rely on the "unlimited storage" behavior of the mobile API.
-- Albums: added copies go to the end, order is not preserved. A photo that fails to join an album blocks the trash step for that photo.
+- Albums: added copies go to the end, order is not preserved. Date and location edits made in Google Photos live outside the file and would not carry over, which is why edited items are excluded.
+- A photo that fails to join an album blocks the trash step for that photo.
 - Favorite, archive and caption are re-applied on a best effort basis. A failure is shown as a warning, not a block.
 - Sequential, one photo at a time. Fine for hundreds of photos.
 - State is one JSON file at `~/.gphotos-shrink/state.json`.
@@ -208,8 +235,10 @@ uv pip install -r requirements.txt     # or: pip install -r requirements.txt
 ruff check . && ruff format --check . && mypy && pytest
 ```
 
-The tests cover the helpers, the compression, the whole state machine, and the CLI happy paths (`scan`, `process`, `trash`, `undo`, `run`, `status`, `auth-check`) against fake Google clients.
+The tests run real compression on generated MPO files and drive the whole state machine and the CLI (`local`, `scan`, `try`, `process`, `trash`, `undo`, `run`, `status`, `auth-check`) against fake Google clients. They cover byte-exact MakerNote and XMP, strip mode, the quality step-down, each outlier-guard fault, album specs, halt-on-failure, shared-album handling and the trash invariants. They prove the tool's logic and its safety rules. They cannot prove Google accepts the calls.
 
-CI runs the same four commands on Python 3.11 to 3.14 for every push to `main` and every pull request.
+Two extra tests run on a real Sony MPF JPEG when `samples/CMN08911.JPG` exists. That folder is gitignored (large, personal), so CI skips them. Drop any real MPF JPEG there under that name to run them.
 
-They run real compression on generated MPO files (EXIF, GPS, MPF stripping, resize) and drive the whole state machine, including `try`, against fake Google clients. They prove the tool's logic and its safety rules. They cannot prove Google accepts the calls.
+CI runs ruff, mypy and pytest on Python 3.11 to 3.14 for every push to `main` and every pull request.
+
+`scripts/bench.py PHOTO OUT_DIR` reproduces the encoder and resolution benchmark behind the defaults (needs `ssimulacra2`, via `brew install jpeg-xl`). Run it on a phone photo or a high-ISO frame before changing the defaults.

@@ -227,3 +227,6 @@ auth_data.txt
 
 # uv lockfile: deliberately not committed, minor and patch bumps should flow in on their own
 uv.lock
+
+# Real photos used by local-only tests (large, personal)
+samples/
