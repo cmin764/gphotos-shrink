@@ -1,0 +1,9 @@
+gpmc>=0.9
+gpwc
+typer>=0.12
+pillow>=10
+requests
+rich
+# dev
+pytest
+ruff

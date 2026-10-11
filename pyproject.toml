@@ -1,0 +1,18 @@
+[project]
+name = "gphotos-shrink"
+version = "0.1.0"
+description = "Replace oversized Google Photos JPEGs with compressed copies, same albums, originals to trash."
+requires-python = ">=3.10"
+dependencies = ["gpmc>=0.9", "gpwc", "typer>=0.12", "pillow>=10", "requests", "rich"]
+
+[project.scripts]
+gphotos-shrink = "gphotos_shrink:app"
+
+[tool.setuptools]
+py-modules = ["gphotos_shrink"]
+
+[tool.ruff]
+line-length = 160
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
