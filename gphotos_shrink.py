@@ -37,6 +37,7 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -161,7 +162,7 @@ class State:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"items": {k: asdict(v) for k, v in self.items.items()}}, indent=1))
-        os.replace(tmp, self._path)
+        tmp.replace(self._path)
 
     def new_keys(self) -> set[str]:
         """Media keys of copies this tool uploaded, which must never be re-processed."""
@@ -200,13 +201,15 @@ class Cache:
 
     def candidates(self, min_bytes: int) -> list[sqlite3.Row]:
         """Own, unedited, non-motion JPEG photos at or above the size threshold, largest first."""
-        with self._connect() as conn:
+        # closing(), because the sqlite3 connection context manager only ends a transaction and leaks the handle.
+        with closing(self._connect()) as conn:
             return conn.execute(self._CANDIDATES, (min_bytes,)).fetchall()
 
     def row(self, media_key: str) -> sqlite3.Row | None:
         """Fetch one cached library row by media key."""
-        with self._connect() as conn:
-            return conn.execute("SELECT * FROM remote_media WHERE media_key = ?", (media_key,)).fetchone()
+        with closing(self._connect()) as conn:
+            row: sqlite3.Row | None = conn.execute("SELECT * FROM remote_media WHERE media_key = ?", (media_key,)).fetchone()
+            return row
 
 
 def item_from_row(row: sqlite3.Row) -> Item:
@@ -483,7 +486,7 @@ class Shrinker:
         for attempt in range(3):
             try:
                 with requests.get(url, stream=True, headers=headers, timeout=120) as resp:
-                    if resp.status_code in (401, 403) and not headers and _is_google_host(url):
+                    if resp.status_code in (401, 403) and not headers and attempt < 2 and _is_google_host(url):
                         # Some download URLs are not pre-signed; retry once with the session token.
                         headers = {"Authorization": f"Bearer {self.gp.api.bearer_token}"}
                         continue
@@ -561,7 +564,7 @@ class Shrinker:
 
     def _carry_metadata(self, item: Item) -> None:
         """Favorite, archive and caption are not part of the file, so re-apply them to the copy."""
-        steps = []
+        steps: list[tuple[str, Callable[[], Any]]] = []
         if item.favorite:
             steps.append(("favorite", lambda: self.gp.api.set_favorite(item.new_dedup_key, True)))
         if item.archived:
@@ -692,7 +695,7 @@ def ask_choice(text: str, choices: str, default: str) -> str:
     """
     while True:
         answer = str(typer.prompt(text, default=default)).strip().lower()
-        if answer in choices:
+        if len(answer) == 1 and answer in choices:
             return answer
         console.print(f"Pick one of: {', '.join(choices)}")
 
