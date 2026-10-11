@@ -51,11 +51,11 @@ mozjpeg and jpegli (built from source) land within about 1 point of Pillow at ma
 | Use | Needs | 8 MP gives |
 |---|---|---|
 | Instagram, Facebook | about 1080 to 2048 px wide | 3464 px |
-| A4 photobook page at 300 DPI | 8.7 MP | 29.3 x 19.6 cm |
-| 30 x 30 cm page | 12.6 MP at 300 DPI | about 200 DPI |
-| A4 spread at 300 DPI | 17.4 MP | not enough, use `--max-mp 16 --target-mb 3.5` |
+| A4 photobook page at 300 DPI | 8.7 MP | 29.3 x 19.6 cm, about 290 DPI on the full page |
+| 30 x 30 cm page | 12.6 MP on a square crop, 18.8 MP filling it from a 3:2 frame | about 195 DPI; 12 MP gives about 240 DPI |
+| A4 spread at 300 DPI | 17.4 MP | not enough, use `--max-mp 18 --target-mb 4` |
 
-If a photo still exceeds the budget, quality steps down 82, 80, 78, 75. If Q75 is over budget the outlier guard stops the run; there is no resolution ladder.
+If a photo still exceeds the budget, quality steps down 82, 80, 78, 75. If Q75 is over the budget plus the guard's 10 percent slack (2.2 MB), the outlier guard stops the run; there is no resolution ladder.
 
 **Metadata technique.** Pillow's `Image.Exif` re-serialization moved the Sony MakerNote (offset 1156 to 936) and the old encode dropped the 57 KB XMP. The fix writes the original EXIF blob verbatim, patches only the four pixel-dimension values in place (`patch_exif_dims`), and passes XMP and ICC through. An exiftool diff of the result against the original shows only the intended changes: dimensions, subsampling and progressive flag, a JFIF header added, MPF gone, and the Sony preview and hidden-data offsets pointing at the removed trailer (harmless exiftool "minor" warnings). Every MakerNote tag, XMP rating, DateTimeOriginal, OffsetTime, SubSec and lens tag is identical.
 
@@ -63,7 +63,7 @@ If a photo still exceeds the budget, quality steps down 82, 80, 78, 75. If Q75 i
 
 ## 5. Assumptions, verified offline vs live
 
-Verified by `pytest` (real Pillow on generated and real files, fake Google clients): the whole state machine, strip and compress output, byte-exact MakerNote and XMP, the outlier guard on injected faults, album spec parsing, halt-on-first-failure, shared-album skipping and warning, quota filter, polling, trash refused without the local original, undo ordering.
+Verified by `pytest` (the `try` command is tested only on its shared-album warning path, not an end-to-end upload) (real Pillow on generated and real files, fake Google clients): the whole state machine, strip and compress output, byte-exact MakerNote and XMP, the outlier guard on injected faults, album spec parsing, halt-on-first-failure, shared-album skipping and warning, quota filter, polling, trash refused without the local original, undo ordering.
 
 Not verified, each is a way the tool may fail on a real account:
 
@@ -117,6 +117,8 @@ gpwc 0.1 (`xob0t/google_photos_web_client`):
 5. **Concurrency.** `gpmc.upload` takes `threads`. Only after rate limits are known.
 6. **Ultra HDR and HEIC.** Skipped today.
 7. **HTML contact sheet** with before and after thumbnails and check results.
+
+Hardened after an independent adversarial review (three blind read-only reviewers): unreadable albums now stop the run, trash re-checks the copy and its albums at the moment of trashing, the uploaded file must match the checked SHA-1, a halt blocks the trash phase, `undo` restores after a lagging trash confirmation, changed settings re-make an un-uploaded copy, signed URLs are scrubbed from stored errors. Known and left: `state.json` has no lock (one instance at a time), Q75 over budget halts instead of lowering resolution, `has_mpf` and `has_gain_map` match raw bytes.
 
 Done in this round: quality guard and EXIF comparison, strip mode, safe album selection, shared-album policy, hard-stop on first failure, 8 MP default. Dropped: jpegli and mozjpeg (measured, not worth a dependency).
 

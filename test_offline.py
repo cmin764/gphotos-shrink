@@ -5,8 +5,9 @@ They prove the tool's logic and its safety rules, not that Google accepts the ca
 
 from __future__ import annotations
 
-import os
+import random
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -97,7 +98,7 @@ def test_compress_keeps_resolution_below_cap(tmp_path: Path) -> None:
 
 
 def noisy_jpeg(path: Path) -> None:
-    Image.frombytes("RGB", (1200, 900), os.urandom(1200 * 900 * 3)).save(path, "JPEG", quality=100)
+    Image.frombytes("RGB", (1200, 900), random.Random(0).randbytes(1200 * 900 * 3)).save(path, "JPEG", quality=100)
 
 
 def test_quality_steps_down_until_the_budget_fits(tmp_path: Path) -> None:
@@ -105,10 +106,10 @@ def test_quality_steps_down_until_the_budget_fits(tmp_path: Path) -> None:
     noisy_jpeg(src)
     assert gs.compress_jpeg(src, tmp_path / "a.jpg", quality=85, max_mp=16.0, target_mb=100)[2] == 85
     assert gs.compress_jpeg(src, tmp_path / "b.jpg", quality=85, max_mp=16.0, target_mb=0.0001)[2] == 75
-    mid = (tmp_path / "a.jpg").stat().st_size * 0.8 / 1e6
+    mid = (tmp_path / "a.jpg").stat().st_size * 0.9 / 1e6
     used = gs.compress_jpeg(src, tmp_path / "c.jpg", quality=85, max_mp=16.0, target_mb=mid)[2]
     assert used < 85
-    assert (tmp_path / "c.jpg").stat().st_size <= mid * 1e6 or used == 75
+    assert (tmp_path / "c.jpg").stat().st_size <= mid * 1e6
 
 
 def test_strip_mpf_removes_trailer_and_keeps_pixels(tmp_path: Path) -> None:
@@ -125,6 +126,8 @@ def test_strip_mpf_removes_trailer_and_keeps_pixels(tmp_path: Path) -> None:
         assert after.format == "JPEG"
         assert before.tobytes() == after.tobytes()
         assert before.getexif()[0x010F] == after.getexif()[0x010F]
+    padded = data[:2] + b"\xff\xff" + data[2:]  # legal fill byte before the first marker
+    assert b"MPF\x00" not in gs.strip_mpf(padded)
     with pytest.raises(ValueError):
         gs.strip_mpf(b"not a jpeg")
     with pytest.raises(ValueError):
@@ -464,7 +467,21 @@ def test_small_gain_is_skipped(world: SimpleNamespace) -> None:
 def test_undo_restores_original_then_drops_copy(world: SimpleNamespace) -> None:
     item = pick(world)
     item.stage, item.new_media_key, item.new_dedup_key = "trashed", NEW_KEY, "copy_dedup"
+    calls: list[str] = []
+    api = world.lib.api
+    restore, trash = api.restore_from_trash, api.move_remote_media_to_trash
+
+    def logged(name: str, call: Any) -> Any:
+        def inner(dedup_keys: list[str]) -> Any:
+            calls.append(name)
+            return call(dedup_keys)
+
+        return inner
+
+    api.restore_from_trash = logged("restore", restore)
+    api.move_remote_media_to_trash = logged("trash", trash)
     world.shrinker.undo(item)
+    assert calls == ["restore", "trash"]  # the original is back before the copy goes
     assert world.lib.api.restored == [item.dedup_key]
     assert world.lib.api.trashed == ["copy_dedup"]
     assert item.stage == "rolled_back"
@@ -505,6 +522,84 @@ def test_trash_refused_without_local_original(world: SimpleNamespace) -> None:
     assert not world.shrinker.advance(item, "trashed")
     assert "local backup" in item.error
     assert world.lib.api.trashed == []
+
+
+def verified_item(world: SimpleNamespace) -> gs.Item:
+    item = pick(world)
+    assert world.shrinker.advance(item, "verified"), item.error
+    return item
+
+
+def test_unreadable_album_stops_the_run(world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_web: object, _key: str) -> set[str]:
+        raise OSError("403")
+
+    monkeypatch.setattr(gs, "album_media_keys", boom)
+    with pytest.raises(RuntimeError, match="could not read album 'Colombia'"):
+        world.shrinker.select(gs.Selection(min_mb=0))
+
+
+def test_trash_rechecks_the_copy_right_now(world: SimpleNamespace) -> None:
+    item = verified_item(world)
+    world.lib.set_trashed(item.new_dedup_key, trashed=True)  # user deleted the copy after looking at it
+    assert not world.shrinker.advance(item, "trashed")
+    assert "no longer in the library" in item.error
+    assert world.lib.api.trashed == []
+
+
+def test_trash_rechecks_album_membership(world: SimpleNamespace) -> None:
+    item = verified_item(world)
+    world.albums[ALBUM.key].discard(item.new_media_key)
+    assert not world.shrinker.advance(item, "trashed")
+    assert "no longer in album" in item.error
+    assert world.lib.api.trashed == []
+
+
+def test_upload_refuses_a_file_that_changed_after_the_check(world: SimpleNamespace) -> None:
+    item = pick(world)
+    assert world.shrinker.advance(item, "compressed")
+    make_jpeg(Path(item.compressed_path), (300, 200))
+    assert not world.shrinker.advance(item, "uploaded")
+    assert "changed after it was checked" in item.error
+    assert world.lib.uploads == []
+
+
+def test_undo_restores_even_if_the_trash_confirmation_lagged(world: SimpleNamespace) -> None:
+    item = verified_item(world)
+    item.trash_requested = True  # the trash call was made, the library had not caught up when the run ended
+    world.shrinker.undo(item)
+    assert world.lib.api.restored == [item.dedup_key]
+
+
+def test_changed_settings_remake_an_unuploaded_copy(world: SimpleNamespace) -> None:
+    item = pick(world)
+    assert world.shrinker.advance(item, "compressed")
+    first = item.new_size
+    world.cfg.quality = 60
+    assert world.shrinker.advance(item, "compressed")
+    assert item.new_size < first
+    assert item.note.endswith("Q60, no MPF")
+
+
+def test_id_reopens_a_skipped_item(world: SimpleNamespace) -> None:
+    world.cfg.min_saving = 0.999
+    item = pick(world)
+    world.shrinker.advance(item, "compressed")
+    assert item.stage == "skipped"
+    assert world.shrinker.select(gs.Selection(min_mb=0)) == []
+    (again,) = world.shrinker.select(gs.Selection(min_mb=0, ids=[ORIGINAL_KEY]))
+    assert again.stage == "candidate"
+
+
+def test_errors_do_not_leak_signed_urls(world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_: object, **__: object) -> None:
+        raise requests.HTTPError("403 for url: https://lh3.googleusercontent.com/x?sig=SECRET")
+
+    monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    item = pick(world)
+    assert not world.shrinker.advance(item, "downloaded")
+    assert "SECRET" not in item.error
 
 
 # --------------------------------------------------------------------------- CLI
@@ -611,6 +706,8 @@ def test_cli_halts_at_first_outlier_unless_keep_going(cli: Any, world: SimpleNam
 
     result = cli("process", "--min-size-mb", "0", "--keep-going")
     assert "Halted" not in result.output
+    assert len(gs.State(state_path).items) == 2  # the second photo was attempted too
+    assert world.lib.uploads == []  # and nothing failed ever reached the upload
 
 
 def test_cli_try_warns_before_touching_a_shared_album(cli: Any, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -662,3 +759,13 @@ def test_real_photo_strip(tmp_path: Path) -> None:
     assert not gs.has_mpf(dst)
     assert SAMPLE.stat().st_size - dst.stat().st_size > 900_000  # the 944 KB trailer
     assert failed_checks(gs.check_copy(SAMPLE, dst, cfg)) == set()
+
+
+def test_cli_halt_blocks_the_trash_phase(cli: Any, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    item = verified_item(world)  # photo A is already verified from an earlier run
+    world.lib.add("second_key", "x" * 27, "IMG_2.JPG", len(world.body) + 1, 1_700_000_000_000)  # photo B, listed first
+    monkeypatch.setattr(gs, "check_copy", lambda *_: [[gs.LOCAL_PREFIX + "pixels match original", False, ""]])
+    result = cli("run", "--min-size-mb", "0", "--apply", "--yes")
+    assert "Halted" in result.output
+    assert world.lib.api.trashed == []
+    assert gs.State(world.cfg.workdir / "state.json").get(item.media_key).stage == "verified"  # type: ignore[union-attr]

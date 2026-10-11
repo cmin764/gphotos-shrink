@@ -8,14 +8,14 @@ Status: the logic is tested offline against fake Google clients and a real Sony 
 
 ## The compression rule
 
-Default: cap at **8 MP (3464 x 2309), JPEG quality 85**, 4:2:0, progressive, Lanczos downscale, under a **2 MB budget**. Chosen by measurement on a real 33 MP Sony file, not by guess: it scored SSIMULACRA2 83 (high quality) at 1.8 MB and was visually indistinguishable from the original at 100 percent. See `RESEARCH.md` section 4.
+Default: cap at **8 MP (3464 x 2309), JPEG quality 85**, 4:2:0, progressive, Lanczos downscale, under a **2 MB budget** (the guard allows 10 percent over, so up to 2.2 MB). Chosen by measurement on a real 33 MP Sony file, not by guess: it scored SSIMULACRA2 83 (high quality) at 1.8 MB and was visually indistinguishable from the original at 100 percent. See `RESEARCH.md` section 4.
 
 | Use | Enough? |
 |---|---|
 | Instagram, Facebook | yes, 3 to 4 times the pixels they keep |
-| A4 photobook page at 300 DPI | yes (29 x 20 cm) |
-| 30 x 30 cm page | about 200 DPI, fine for a book; for 300 DPI use `--max-mp 12` |
-| A4 spread or poster | `--max-mp 16 --target-mb 3.5` |
+| A4 photobook page | about 290 DPI on the full page, effectively 300 (29.3 x 19.6 cm at 300 DPI) |
+| 30 x 30 cm page | about 195 DPI, fine for a book; `--max-mp 12` gives about 240 DPI, 300 DPI needs about 19 MP |
+| A4 spread (17.4 MP at 300 DPI) | `--max-mp 18 --target-mb 4` |
 
 If a copy exceeds `--target-mb`, quality steps down (82, 80, 78, 75). The original EXIF blob is written byte for byte (Sony MakerNote offsets stay valid), with only the pixel dimensions patched. XMP and the ICC profile are carried over. Nothing is rotated, so Orientation stays valid.
 
@@ -25,13 +25,13 @@ If a copy exceeds `--target-mb`, quality steps down (82, 80, 78, 75). The origin
 
 1. download the original, check size and SHA-1 against the library
 2. make the copy (compress or strip)
-3. **outlier guard**, before anything is uploaded: smaller than the original, inside the size budget, same aspect ratio and orientation, Make, Model, DateTimeOriginal, OffsetTime, lens, MakerNote, GPS and XMP identical, and a 256 px pixel comparison to catch a wrong frame or colour shift. Any failure stops the run
+3. **outlier guard**, before anything is uploaded: smaller than the original, inside the size budget, same aspect ratio and orientation, Make, Model, DateTimeOriginal, OffsetTimeOriginal, lens, MakerNote and GPS identical and XMP still present, and a 256 px pixel comparison to catch a wrong frame or colour shift. Any failure stops the run
 4. upload the copy with the original file name
 5. add the copy to every album the original was in, carry over favorite, archive and caption
 6. verify (polls up to a minute, the library is eventually consistent): copy exists, is smaller, capture time and file name kept, present in each album
-7. move the original to trash (separate, gated step, refused unless the downloaded original is still on disk)
+7. move the original to trash (separate, gated step). It re-checks right then: the copy is still in the library and every album, and the downloaded original is still on disk with the same SHA-1
 
-Progress is saved after every stage. **A batch halts at the first photo that fails a check** and prints where the original and the copy are; `--keep-going` parks it and continues instead. Rerun to resume.
+Progress is saved after every stage. **A batch halts at the first photo that fails a check**, trashes nothing in that run, and prints where the original and the copy are; `--keep-going` parks it and continues instead. A copy that was made with different settings than the current run is re-made before upload. A changed file never uploads: the copy's SHA-1 must still match what was checked. Reading any album fails closed (the run stops, never "skip that album"). Rerun to resume.
 
 ## Install
 
@@ -113,7 +113,7 @@ It prints the account each client signed in as (visible with `-v`). Confirm they
 
 ## Commands
 
-Every command that changes anything online is a dry run until you pass `--apply`.
+Commands that change anything online are a dry run until you pass `--apply`. The exception is `try`, which is interactive and asks before each irreversible step.
 
 | Command | What it does | Changes online? |
 |---|---|---|
@@ -127,11 +127,11 @@ Every command that changes anything online is a dry run until you pass `--apply`
 | `undo --id KEY` | restore the original from trash, then trash the copy | with `--apply` |
 | `status` | stage, sizes and errors per tracked photo | no |
 
-Options on `scan`, `try`, `process`, `run`:
+Options (not every one exists on every command; see `--help`):
 
 - `--album` (repeatable): the album's title, its key, a `photos.google.com/.../album/<key>` or `/share/<key>` URL, or a `photos.app.goo.gl` short link. A duplicate title is refused and the keys are listed; a typo gets suggestions.
 - `--include-shared`: photos in albums shared with others are skipped by default (adding a copy may notify members and loses custom position). `try` includes them but asks before touching one.
-- `--id`, `--limit`, `--min-size-mb` (5).
+- `--id` (reopens a skipped or undone photo), `--limit` (not on `try`), `--min-size-mb` (5).
 - `--max-mp` (8), `--quality` (85), `--target-mb` (2.0), `--mode compress|strip`, `--min-saving` (0.20), `--saver/--original`, `--no-hash-check`, `--keep-going`.
 
 Only photos that are your own, unedited and charged to your quota are candidates. Run any command with `--help`.
@@ -211,7 +211,7 @@ gphotos-shrink trash --apply                   # after you spot-checked in the P
 - Albums: added copies go to the end, order is not preserved. Date and location edits made in Google Photos live outside the file and would not carry over, which is why edited items are excluded.
 - A photo that fails to join an album blocks the trash step for that photo.
 - Favorite, archive and caption are re-applied on a best effort basis. A failure is shown as a warning, not a block.
-- Sequential, one photo at a time. Fine for hundreds of photos.
+- Sequential, one photo at a time. Fine for hundreds of photos. Run one instance at a time: `state.json` has no lock.
 - State is one JSON file at `~/.gphotos-shrink/state.json`.
 
 ## Work directory
