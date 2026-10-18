@@ -733,6 +733,22 @@ def test_cli_local_needs_no_account(tmp_path: Path) -> None:
     assert "all ok" in result.output
 
 
+def test_cli_local_folders_png_and_oversized(tmp_path: Path) -> None:
+    root = tmp_path / "pics"
+    (root / "Geo").mkdir(parents=True)
+    make_jpeg(root / "a.JPG", (2400, 1800))
+    make_jpeg(root / "Geo" / "b.jpeg", (2400, 1800))
+    Image.effect_noise((1500, 1500), 90).convert("RGBA").save(root / "Geo" / "c.png")  # noise: cannot hit a tiny budget
+    (root / "Geo" / "raw.ARW").write_bytes(b"x")
+    out = root / "Compressed"  # inside the input on purpose: a rerun must not eat its own output
+    args = ["local", str(root), "-o", str(out), "--target-mb", "0.2"]
+    env = {"GPS_WORKDIR": str(tmp_path / "w"), "GP_AUTH_DATA": ""}
+    for _ in range(2):
+        result = CliRunner().invoke(gs.app, args, env=env)
+        assert result.exit_code == 0, result.output
+        assert sorted(p.relative_to(out).as_posix() for p in out.rglob("*.jpg")) == ["Geo/b_compress.jpg", "Geo/c_compress_oversized.jpg", "a_compress.jpg"]
+
+
 # --------------------------------------------------------------------------- real photo (local only)
 
 SAMPLE = Path(__file__).parent / "samples" / "CMN08911.JPG"

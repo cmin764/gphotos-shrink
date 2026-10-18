@@ -406,10 +406,22 @@ def _touch(path: Path, mtime_ms: int | None) -> None:
         os.utime(path, (seconds, seconds))
 
 
+def _rgb(im: Image.Image) -> Image.Image:
+    """RGB view of an image; transparency is flattened onto white, as JPEG has no alpha."""
+    if im.mode == "RGB":
+        return im
+    if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+        rgba = im.convert("RGBA")
+        flat = Image.new("RGB", rgba.size, "white")
+        flat.paste(rgba, mask=rgba.getchannel("A"))
+        return flat
+    return im.convert("RGB")
+
+
 def compress_jpeg(
     src: Path, dst: Path, *, quality: int, max_mp: float, target_mb: float = DEFAULT_TARGET_MB, mtime_ms: int | None = None
 ) -> tuple[int, int, int]:
-    """Re-encode a JPEG: cap resolution, lower quality, keep every metadata block.
+    """Re-encode a JPEG (or PNG): cap resolution, lower quality, keep every metadata block.
 
     Re-encoding with Pillow drops the Multi-Picture Format (MPF) trailer that
     Sony and Android cameras append, which is exactly what makes Google's
@@ -436,7 +448,7 @@ def compress_jpeg(
         exif: bytes = im.info.get("exif", b"")
         if im.mode != "RGB":
             extras.pop("icc_profile", None)  # a CMYK or grayscale profile does not describe the RGB pixels written below
-        out = im if im.mode == "RGB" else im.convert("RGB")
+        out = _rgb(im)
         width, height = out.size
         if width * height > max_mp * 1_000_000:
             scale = math.sqrt(max_mp * 1_000_000 / (width * height))
@@ -476,7 +488,7 @@ def _thumb(path: Path) -> Image.Image:
     with Image.open(path) as im:
         if getattr(im, "n_frames", 1) > 1:
             im.seek(0)
-        return im.convert("RGB").resize((256, 256), Image.Resampling.BILINEAR)
+        return _rgb(im).resize((256, 256), Image.Resampling.BILINEAR)
 
 
 def check_copy(src: Path, dst: Path, cfg: Config) -> list[list[Any]]:
@@ -1403,11 +1415,32 @@ def undo(
         console.print(f"{item.file_name}: undone")
 
 
+LOCAL_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def _gather(paths: list[Path], out: Path) -> list[tuple[Path, Path]]:
+    """Expand folders into (file, folder relative to its root) pairs, sorted.
+
+    Plain files map to the output root. Anything under the output folder is
+    skipped so a rerun never recompresses its own copies.
+    """
+    found: list[tuple[Path, Path]] = []
+    out_dir = out.resolve()
+    for path in paths:
+        if path.is_dir():
+            for f in sorted(path.rglob("*")):
+                if f.is_file() and f.suffix.lower() in LOCAL_SUFFIXES and out_dir not in f.resolve().parents:
+                    found.append((f, f.parent.relative_to(path)))
+        else:
+            found.append((path, Path()))
+    return found
+
+
 @app.command()
 def local(
     ctx: typer.Context,
-    files: Annotated[list[Path], typer.Argument(help="JPEG files to shrink.", exists=True, dir_okay=False)],
-    out: Annotated[Path, typer.Option("--out", "-o", help="Folder for the copies.")] = Path("shrunk"),
+    files: Annotated[list[Path], typer.Argument(help="JPEG/PNG files, or folders searched recursively.", exists=True)],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Folder for the copies. Folder arguments keep their subfolder layout inside it.")] = Path("shrunk"),
     quality: QualityOpt = DEFAULT_QUALITY,
     max_mp: MaxMpOpt = DEFAULT_MAX_MP,
     target_mb: TargetMbOpt = DEFAULT_TARGET_MB,
@@ -1416,7 +1449,8 @@ def local(
     """Shrink local files with the exact pipeline and checks used on Google Photos. No account needed.
 
     Use it to vet the settings on your own photos before touching the library.
-    Exits non-zero if any copy fails a check.
+    Copies over the size budget are kept and renamed *_oversized.jpg. Exits
+    non-zero if any copy fails another check.
     """
     st: Settings = ctx.obj
     cfg = _cfg(st, quality, max_mp, 0.0, False, True, target_mb, mode)
@@ -1424,8 +1458,12 @@ def local(
     for col in ("file", "size", "result", "dims", "checks"):
         table.add_column(col)
     bad = 0
-    for src in files:
-        dst = out / f"{src.stem}_{mode.value}.jpg"
+    claimed: set[Path] = set()
+    for src, rel in _gather(files, out):
+        dst = out / rel / f"{src.stem}_{mode.value}.jpg"
+        if dst in claimed:  # a.jpg and a.png side by side
+            dst = dst.with_name(f"{src.stem}_{src.suffix.lstrip('.').lower()}_{mode.value}.jpg")
+        claimed.add(dst)
         try:
             width, height, used = make_copy(src, dst, cfg)
         except SkipItem as exc:
@@ -1433,13 +1471,18 @@ def local(
             continue
         checks = check_copy(src, dst, cfg)
         failed = [c[0].removeprefix(LOCAL_PREFIX) for c in checks if not c[1]]
-        bad += bool(failed)
+        oversized = failed == ["within size budget"]
+        if oversized:  # a slightly big copy is still usable, just easy to spot
+            dst = dst.replace(dst.with_name(f"{dst.stem}_oversized.jpg"))
+        elif failed:
+            bad += 1
+        status = "[yellow]oversized[/yellow]" if oversized else f"[red]FAIL: {', '.join(failed)}[/red]" if failed else "[green]all ok[/green]"
         table.add_row(
-            src.name,
+            str(rel / src.name),
             human(src.stat().st_size),
             f"{human(dst.stat().st_size)}" + (f" Q{used}" if used else ""),
             f"{width}x{height}",
-            "[red]FAIL: " + ", ".join(failed) + "[/red]" if failed else "[green]all ok[/green]",
+            status,
         )
     console.print(table)
     if bad:

@@ -41,6 +41,8 @@ uv pip install -e .                    # runtime only; use '.[dev]' (or -r requi
 . .venv/bin/activate && gphotos-shrink --help
 ```
 
+To run it from any folder without activating anything, install it as a uv tool: `uv tool install -e .` puts `gphotos-shrink` on your PATH and edits to this checkout apply immediately. Update with `uv tool upgrade gphotos-shrink`, remove with `uv tool uninstall gphotos-shrink`.
+
 Plain `python -m venv .venv && pip install -e .` works the same. Python 3.14 is the recommended version (everything is tested on it); 3.11 to 3.14 are supported.
 
 With uv, run tools as `uv run --no-sync <cmd>` or activate the venv. A bare `uv run` re-resolves the project and writes a `uv.lock`, which is git-ignored on purpose: there is no lockfile, so minor and patch releases flow in on their own.
@@ -117,7 +119,7 @@ Commands that change anything online are a dry run until you pass `--apply`. The
 
 | Command | What it does | Changes online? |
 |---|---|---|
-| `local FILE... -o DIR` | run the exact copy pipeline and checks on local files, no credentials needed | no |
+| `local PATH... -o DIR` | run the exact copy pipeline and checks on local JPEG/PNG files or folders (recursive, subfolders mirrored under `DIR`), no credentials needed. Copies over the size budget are kept as `*_oversized.jpg`. PNG transparency is flattened onto white | no |
 | `auth-check` | verify both credentials | no |
 | `scan` | list candidates at or above `--min-size-mb` (default 5) with albums | no |
 | `try` | interactive test on a few photos, approval before each irreversible step, stops at the first failed check | only as you approve |
