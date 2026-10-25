@@ -19,7 +19,7 @@ dependencies = [
     "gpmc~=0.9.0",
     "gpwc @ git+https://github.com/xob0t/google_photos_web_client@651aa268d50529cb6128c8a42c9cd4ce668f2189",
     "typer>=0.27,<1",
-    "pillow>=12.3,<13",
+    "pillow>=12.3,<14",
     "requests>=2.34,<3",
     "rich>=15,<16",
 ]
